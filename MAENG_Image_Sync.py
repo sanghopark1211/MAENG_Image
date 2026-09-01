@@ -26,7 +26,7 @@ import time
 import queue
 import threading
 import tkinter as tk
-from tkinter import ttk, filedialog
+from tkinter import ttk, filedialog, simpledialog
 
 import numpy as np
 import cv2
@@ -39,7 +39,9 @@ PANEL_SIZE   = 560        # 각 패널 '초기' 표시 크기 [px] — 창을 �
 PANEL_MIN    = 320        # 최소 패널 크기
 FPS_LIST     = [60, 30, 15, 5, 2, 1]
 DEFAULT_FPS  = 30
-UM_PER_PX    = 5.0        # ★ 1픽셀당 실제 길이 [um/px] — BUE 크기 환산용 (광학계 보정값)
+UM_PER_PX    = 5.0        # 1픽셀당 실제 길이 [um/px] 초기값.
+                          # ★ 앱에서 '스케일 보정' 모드로 절삭깊이(100um) 등
+                          #   아는 길이를 드래그하면 자동 갱신된다.
 
 # ----- 다크 테마 색 -----
 C_BG     = '#14161a'      # 창 배경
@@ -326,11 +328,12 @@ class Panel:
 
     def meas_press(self, e):
         mode = self.app.var_mode.get()
-        if mode == 'angle':
+        if mode in ('angle', 'cal'):
+            col = '#ffe14d' if mode == 'angle' else '#5bff8a'
             line = self.canvas.create_line(e.x, e.y, e.x, e.y,
-                                           fill='#ffe14d', width=2)
+                                           fill=col, width=2)
             txt = self.canvas.create_text(e.x + 10, e.y - 12, text='',
-                                          fill='#ffe14d', anchor='w',
+                                          fill=col, anchor='w',
                                           font=('Consolas', 12, 'bold'))
             self._drag = (e.x, e.y, line, txt)
         elif mode == 'bue':
@@ -341,7 +344,13 @@ class Panel:
             x0, y0, line, txt = self._drag
             self.canvas.coords(line, x0, y0, e.x, e.y)
             ang = self._angle_of(x0, y0, e.x, e.y)
-            self.canvas.itemconfig(txt, text=f'{ang:.1f}\u00b0')
+            # 원본 픽셀 기준 길이 + 실측 환산 (칩 두께 측정용)
+            sx0, sy0 = self._to_src(x0, y0)
+            sx1, sy1 = self._to_src(e.x, e.y)
+            L = math.hypot(sx1 - sx0, sy1 - sy0)
+            um = self.app.um_per_px
+            self.canvas.itemconfig(
+                txt, text=f'{ang:.1f}\u00b0  {L:.0f}px ({L*um:.0f}\u00b5m)')
             self.canvas.coords(txt, (x0 + e.x) / 2 + 12, (y0 + e.y) / 2 - 12)
         elif self._poly:
             # 마지막 꼭짓점 → 마우스 미리보기 선
@@ -352,11 +361,36 @@ class Panel:
         if not self._drag:
             return
         x0, y0, line, txt = self._drag
+        mode = self.app.var_mode.get()
         self._drag = None
         if abs(e.x - x0) < 4 and abs(e.y - y0) < 4:      # 클릭만 한 경우
             self.canvas.delete(line); self.canvas.delete(txt)
             return
+
+        sx0, sy0 = self._to_src(x0, y0)
+        sx1, sy1 = self._to_src(e.x, e.y)
+        L = math.hypot(sx1 - sx0, sy1 - sy0)
+
+        if mode == 'cal':
+            # ★ 스케일 보정: 드래그한 선의 실제 길이를 물어 um/px 갱신
+            self.canvas.delete(line); self.canvas.delete(txt)
+            real = simpledialog.askfloat(
+                '스케일 보정', f'방금 그은 선({L:.1f}px)의 실제 길이 [\u00b5m]:\n'
+                '(절삭 전 가공 깊이 = 100 \u00b5m)',
+                initialvalue=100.0, minvalue=0.1, parent=self.app.tk)
+            if real and L > 1:
+                self.app.set_scale(real / L)
+                self.app.log_memo(
+                    f'[스케일] {L:.1f}px = {real:g}\u00b5m '
+                    f'-> {real/L:.4f} \u00b5m/px')
+            return
+
+        ang = self._angle_of(x0, y0, e.x, e.y)
+        um = self.app.um_per_px
         self.meas_items += [line, txt]
+        self.app.log_memo(
+            f'[{self.side}] fr{self.i+1}  선 {ang:.1f}deg  '
+            f'L={L:.0f}px ({L*um:.0f}um)')
 
     # ---- BUE 다각형: 좌클릭 = 꼭짓점 추가, 우클릭 = 닫기 ----
     def _poly_add(self, x, y):
@@ -394,7 +428,7 @@ class Panel:
             x0, y0 = sp[k];  x1, y1 = sp[(k + 1) % len(sp)]
             area += x0 * y1 - x1 * y0
         area = abs(area) / 2.0
-        um = UM_PER_PX
+        um = self.app.um_per_px
         txt = (f'H {h_px:.0f}px ({h_px*um:.0f}\u00b5m)\n'
                f'W {w_px:.0f}px ({w_px*um:.0f}\u00b5m)\n'
                f'A {area:.0f}px\u00b2 ({area*um*um/1e6:.4f}mm\u00b2)')
@@ -610,15 +644,22 @@ class App:
         sec('🖌 그림판')
         self.var_mode = tk.StringVar(value='off')
         for txt, val in (('끄기', 'off'), ('📐 각도 측정', 'angle'),
-                         ('△ BUE 크기 측정', 'bue')):
+                         ('△ BUE 크기 측정', 'bue'),
+                         ('⚖ 스케일 보정', 'cal')):
             tk.Radiobutton(side, text=txt, value=val, variable=self.var_mode,
                            bg=C_PANEL, fg=C_FG, selectcolor=C_BTN,
                            activebackground=C_PANEL, activeforeground=C_FG,
                            anchor='w', font=('Malgun Gothic', 9)
                            ).pack(fill='x', padx=14)
-        tk.Label(side, text='BUE: 좌클릭=꼭짓점, 우클릭=완성', bg=C_PANEL,
-                 fg=C_SUB, anchor='w', font=('Malgun Gothic', 8)
-                 ).pack(fill='x', padx=14)
+        tk.Label(side, text='BUE: 좌클릭=꼭짓점, 우클릭=완성\n'
+                 '보정: 아는 길이(깊이 100\u00b5m)를 드래그',
+                 bg=C_PANEL, fg=C_SUB, anchor='w', justify='left',
+                 font=('Malgun Gothic', 8)).pack(fill='x', padx=14)
+        self.um_per_px = UM_PER_PX
+        self.lbl_scale = tk.Label(side, text=f'스케일 {UM_PER_PX:.3f} \u00b5m/px',
+                                  bg=C_PANEL, fg='#5bff8a', anchor='w',
+                                  font=('Consolas', 9, 'bold'))
+        self.lbl_scale.pack(fill='x', padx=14)
         sbtn('선 지우기', lambda: (self.L.meas_clear(), self.R.meas_clear()))
 
         # --- 동시 재생 ---
@@ -775,6 +816,10 @@ class App:
         self.panel_size = ps
         for p in (self.L, self.R):
             p.resize_canvas(ps)
+
+    def set_scale(self, um_per_px):
+        self.um_per_px = float(um_per_px)
+        self.lbl_scale.config(text=f'스케일 {self.um_per_px:.3f} \u00b5m/px')
 
     def log_memo(self, line):
         self.memo.insert('end', line + '\n')
