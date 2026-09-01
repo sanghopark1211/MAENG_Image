@@ -26,7 +26,7 @@ import time
 import queue
 import threading
 import tkinter as tk
-from tkinter import ttk, filedialog
+from tkinter import ttk, filedialog, simpledialog
 
 import numpy as np
 import cv2
@@ -42,8 +42,9 @@ DEFAULT_FPS  = 30
 HOT_THR      = 120        # 핫픽셀 판정 문턱 [DN] — 같은 색 이웃 중앙값보다
                           #   이만큼 밝으면 '반짝이'로 보고 이웃값으로 치환.
                           #   남으면 80 으로 낮추고, 실제 스펙클까지 지워지면 200 으로.
-UM_PER_PX    = 5.0        # ★ 1픽셀당 실제 길이 [um/px] — 모든 측정의 환산 계수.
-                          #   광학계 배율이 바뀌면 이 값만 수정 (100um 깊이 = 20px 기준)
+UM_PER_PX    = 2.56       # ★ 1픽셀당 실제 길이 [um/px] — 모든 측정의 환산 계수.
+                          #   근거: 절삭깊이 100um = 39px (노랑:파랑 = 3.18:1.28 실측)
+                          #   광학계 배율이 바뀌면 '스케일 보정' 모드로 재측정
 
 # ----- 다크 테마 색 -----
 C_BG     = '#14161a'      # 창 배경
@@ -348,8 +349,8 @@ class Panel:
 
     def meas_press(self, e):
         mode = self.app.var_mode.get()
-        if mode == 'angle':
-            col = '#ffe14d'
+        if mode in ('angle', 'cal'):
+            col = '#ffe14d' if mode == 'angle' else '#5bff8a'
             line = self.canvas.create_line(e.x, e.y, e.x, e.y,
                                            fill=col, width=2)
             txt = self.canvas.create_text(e.x + 10, e.y - 12, text='',
@@ -390,6 +391,21 @@ class Panel:
         sx0, sy0 = self._to_src(x0, y0)
         sx1, sy1 = self._to_src(e.x, e.y)
         L = math.hypot(sx1 - sx0, sy1 - sy0)
+
+        if mode == 'cal':
+            # ★ 스케일 보정: 아는 길이를 그으면 um/px 를 갱신
+            self.canvas.delete(line); self.canvas.delete(txt)
+            real = simpledialog.askfloat(
+                '스케일 보정',
+                f'방금 그은 선 = {L:.1f}px\n실제 길이 [µm]?  '
+                '(절삭 전 가공 깊이 = 100)',
+                initialvalue=100.0, minvalue=0.1, parent=self.app.tk)
+            if real and L > 1:
+                self.app.set_scale(real / L)
+                self.app.log_memo(
+                    f'[스케일] {L:.1f}px = {real:g}um -> '
+                    f'{real/L:.3f} um/px')
+            return
 
         ang = self._angle_of(x0, y0, e.x, e.y)
         um = self.app.um_per_px
@@ -650,14 +666,16 @@ class App:
         sec('🖌 그림판')
         self.var_mode = tk.StringVar(value='off')
         for txt, val in (('끄기', 'off'), ('📐 각도 측정', 'angle'),
-                         ('△ BUE 크기 측정', 'bue')):
+                         ('△ BUE 크기 측정', 'bue'),
+                         ('⚖ 스케일 보정', 'cal')):
             tk.Radiobutton(side, text=txt, value=val, variable=self.var_mode,
                            bg=C_PANEL, fg=C_FG, selectcolor=C_BTN,
                            activebackground=C_PANEL, activeforeground=C_FG,
                            anchor='w', font=('Malgun Gothic', 9)
                            ).pack(fill='x', padx=14)
-        tk.Label(side, text='BUE: 좌클릭=꼭짓점, 우클릭=완성',
-                 bg=C_PANEL, fg=C_SUB, anchor='w',
+        tk.Label(side, text='BUE: 좌클릭=꼭짓점, 우클릭=완성\n'
+                 '보정: 절삭깊이(100µm) 구간을 드래그',
+                 bg=C_PANEL, fg=C_SUB, anchor='w', justify='left',
                  font=('Malgun Gothic', 8)).pack(fill='x', padx=14)
         self.um_per_px = UM_PER_PX
         self.lbl_scale = tk.Label(side, text=f'스케일 {UM_PER_PX:.3f} \u00b5m/px',
@@ -822,6 +840,11 @@ class App:
         self.panel_size = ps
         for p in (self.L, self.R):
             p.resize_canvas(ps)
+
+    def set_scale(self, um_per_px):
+        self.um_per_px = float(um_per_px)
+        self.lbl_scale.config(
+            text=f'스케일 {self.um_per_px:.3f} µm/px')
 
     def log_memo(self, line):
         self.memo.insert('end', line + '\n')
