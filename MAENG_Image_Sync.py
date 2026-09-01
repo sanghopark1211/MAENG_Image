@@ -26,7 +26,7 @@ import time
 import queue
 import threading
 import tkinter as tk
-from tkinter import ttk, filedialog, simpledialog
+from tkinter import ttk, filedialog
 
 import numpy as np
 import cv2
@@ -39,9 +39,11 @@ PANEL_SIZE   = 560        # 각 패널 '초기' 표시 크기 [px] — 창을 �
 PANEL_MIN    = 320        # 최소 패널 크기
 FPS_LIST     = [60, 30, 15, 5, 2, 1]
 DEFAULT_FPS  = 30
-UM_PER_PX    = 5.0        # 1픽셀당 실제 길이 [um/px] 초기값.
-                          # ★ 앱에서 '스케일 보정' 모드로 절삭깊이(100um) 등
-                          #   아는 길이를 드래그하면 자동 갱신된다.
+HOT_THR      = 120        # 핫픽셀 판정 문턱 [DN] — 같은 색 이웃 중앙값보다
+                          #   이만큼 밝으면 '반짝이'로 보고 이웃값으로 치환.
+                          #   남으면 80 으로 낮추고, 실제 스펙클까지 지워지면 200 으로.
+UM_PER_PX    = 5.0        # ★ 1픽셀당 실제 길이 [um/px] — 모든 측정의 환산 계수.
+                          #   광학계 배율이 바뀌면 이 값만 수정 (100um 깊이 = 20px 기준)
 
 # ----- 다크 테마 색 -----
 C_BG     = '#14161a'      # 창 배경
@@ -105,12 +107,29 @@ class CineReader:
         self._lutR = g(x * rG)          # WB 를 감마 LUT 에 합침 (정수 인덱싱만)
         self._lutB = g(x * bG)
 
-    def to_rgb8(self, fr, color=True):
+    @staticmethod
+    def _despeckle(raw):
+        """핫픽셀(반짝이) 제거 — 디모자이크 '전' raw Bayer 에서.
+        같은 색 이웃(±2px 상하좌우)의 중앙값보다 HOT_THR 이상 밝은
+        '고립된 한 픽셀'만 이웃값으로 치환한다. 진짜 스펙클 하이라이트는
+        여러 픽셀 덩어리라 이웃도 밝으므로 건드리지 않는다."""
+        pad = np.pad(raw, 2, mode='edge')
+        nb = np.stack([pad[:-4, 2:-2], pad[4:, 2:-2],
+                       pad[2:-2, :-4], pad[2:-2, 4:]])   # 같은 Bayer 색 이웃 4개
+        med = np.median(nb, axis=0)
+        hot = raw.astype(np.int32) - med > HOT_THR
+        out = raw.copy()
+        out[hot] = med[hot].astype(raw.dtype)
+        return out
+
+    def to_rgb8(self, fr, color=True, despeckle=True):
         if self.bpp is None:
             self.bpp = 12
         if self._lut is None:
             self._build_luts()
         maxv = (1 << self.bpp) - 1
+        if despeckle:
+            fr = self._despeckle(fr)
         if self.cfa == 0 or not color:
             g = self._lut[np.minimum(fr, maxv)]
             return cv2.cvtColor(g, cv2.COLOR_GRAY2RGB)
@@ -232,6 +251,7 @@ class Panel:
         self.i = 0
         self.playing = False
         self.want_seek = None
+        self.t_last = None            # 실시간 재생 기준 시각 (프레임 스킵용)
         self._sld_guard = False
 
         f = tk.Frame(parent, bg=C_PANEL, highlightthickness=1,
@@ -328,8 +348,8 @@ class Panel:
 
     def meas_press(self, e):
         mode = self.app.var_mode.get()
-        if mode in ('angle', 'cal'):
-            col = '#ffe14d' if mode == 'angle' else '#5bff8a'
+        if mode == 'angle':
+            col = '#ffe14d'
             line = self.canvas.create_line(e.x, e.y, e.x, e.y,
                                            fill=col, width=2)
             txt = self.canvas.create_text(e.x + 10, e.y - 12, text='',
@@ -370,20 +390,6 @@ class Panel:
         sx0, sy0 = self._to_src(x0, y0)
         sx1, sy1 = self._to_src(e.x, e.y)
         L = math.hypot(sx1 - sx0, sy1 - sy0)
-
-        if mode == 'cal':
-            # ★ 스케일 보정: 드래그한 선의 실제 길이를 물어 um/px 갱신
-            self.canvas.delete(line); self.canvas.delete(txt)
-            real = simpledialog.askfloat(
-                '스케일 보정', f'방금 그은 선({L:.1f}px)의 실제 길이 [\u00b5m]:\n'
-                '(절삭 전 가공 깊이 = 100 \u00b5m)',
-                initialvalue=100.0, minvalue=0.1, parent=self.app.tk)
-            if real and L > 1:
-                self.app.set_scale(real / L)
-                self.app.log_memo(
-                    f'[스케일] {L:.1f}px = {real:g}\u00b5m '
-                    f'-> {real/L:.4f} \u00b5m/px')
-            return
 
         ang = self._angle_of(x0, y0, e.x, e.y)
         um = self.app.um_per_px
@@ -644,16 +650,14 @@ class App:
         sec('🖌 그림판')
         self.var_mode = tk.StringVar(value='off')
         for txt, val in (('끄기', 'off'), ('📐 각도 측정', 'angle'),
-                         ('△ BUE 크기 측정', 'bue'),
-                         ('⚖ 스케일 보정', 'cal')):
+                         ('△ BUE 크기 측정', 'bue')):
             tk.Radiobutton(side, text=txt, value=val, variable=self.var_mode,
                            bg=C_PANEL, fg=C_FG, selectcolor=C_BTN,
                            activebackground=C_PANEL, activeforeground=C_FG,
                            anchor='w', font=('Malgun Gothic', 9)
                            ).pack(fill='x', padx=14)
-        tk.Label(side, text='BUE: 좌클릭=꼭짓점, 우클릭=완성\n'
-                 '보정: 아는 길이(깊이 100\u00b5m)를 드래그',
-                 bg=C_PANEL, fg=C_SUB, anchor='w', justify='left',
+        tk.Label(side, text='BUE: 좌클릭=꼭짓점, 우클릭=완성',
+                 bg=C_PANEL, fg=C_SUB, anchor='w',
                  font=('Malgun Gothic', 8)).pack(fill='x', padx=14)
         self.um_per_px = UM_PER_PX
         self.lbl_scale = tk.Label(side, text=f'스케일 {UM_PER_PX:.3f} \u00b5m/px',
@@ -674,7 +678,7 @@ class App:
         # --- 속도 ---
         sec('속도')
         self.fps_value = float(DEFAULT_FPS)
-        self.sld_fps = ttk.Scale(side, from_=1, to=120, length=150,
+        self.sld_fps = ttk.Scale(side, from_=1, to=1000, length=150,
                                  value=DEFAULT_FPS, command=self.on_fps)
         self.sld_fps.pack(fill='x', padx=12)
         self.lbl_fps = tk.Label(side, text=f'{DEFAULT_FPS:.0f} fps',
@@ -687,8 +691,10 @@ class App:
         self.var_loop = tk.BooleanVar(value=True)
         self.var_pix = tk.BooleanVar(value=False)
         self.var_color = tk.BooleanVar(value=True)
+        self.var_despk = tk.BooleanVar(value=True)
         for txt, var in (('루프', self.var_loop), ('픽셀 선명', self.var_pix),
-                         ('컬러', self.var_color)):
+                         ('컬러', self.var_color),
+                         ('반짝이 제거', self.var_despk)):
             tk.Checkbutton(side, text=txt, variable=var, bg=C_PANEL, fg=C_FG,
                            selectcolor=C_BTN, activebackground=C_PANEL,
                            activeforeground=C_FG, anchor='w',
@@ -817,10 +823,6 @@ class App:
         for p in (self.L, self.R):
             p.resize_canvas(ps)
 
-    def set_scale(self, um_per_px):
-        self.um_per_px = float(um_per_px)
-        self.lbl_scale.config(text=f'스케일 {self.um_per_px:.3f} \u00b5m/px')
-
     def log_memo(self, line):
         self.memo.insert('end', line + '\n')
         self.memo.see('end')
@@ -858,16 +860,31 @@ class App:
                 if p.want_seek is not None:
                     idx = p.want_seek
                     p.want_seek = None
+                    p.t_last = None
                     self._decode_show(p, idx)
                 elif p.playing and p.reader:
-                    nxt = p.i + 1
+                    # ★ 실시간 재생: 경과 시간 x fps 만큼 전진.
+                    #   설정 fps 가 디코딩 한계(~30/s)보다 높으면 중간 프레임을
+                    #   건너뛰어 '실제 시간 비율'을 지킨다 (1000fps 도 유효).
+                    now2 = time.time()
+                    if p.t_last is None:
+                        adv = 1
+                    else:
+                        adv = int((now2 - p.t_last) * fps)
+                        adv = max(1, min(adv, int(fps)))   # 폭주 방지 (최대 1초분)
+                    p.t_last = now2
+                    nxt = p.i + adv
                     if nxt >= p.reader.n:
                         if loop:
-                            nxt = 0
+                            nxt %= p.reader.n
                         else:
+                            nxt = p.reader.n - 1
                             p.playing = False
-                            continue
+                            if nxt == p.i:
+                                continue
                     self._decode_show(p, nxt)
+                else:
+                    p.t_last = None
 
     def _serve_seeks(self):
         for p in (self.L, self.R):
@@ -886,8 +903,9 @@ class App:
             return
         if fr is None:
             return
-        rgb = r.to_rgb8(fr, color=self.var_color.get())
-        interp = cv2.INTER_NEAREST if self.var_pix.get() else cv2.INTER_CUBIC
+        rgb = r.to_rgb8(fr, color=self.var_color.get(),
+                        despeckle=self.var_despk.get())
+        interp = cv2.INTER_NEAREST if self.var_pix.get() else cv2.INTER_LANCZOS4
         ps = self.panel_size
         h, w = rgb.shape[:2]
         scale = min(ps / w, ps / h)
