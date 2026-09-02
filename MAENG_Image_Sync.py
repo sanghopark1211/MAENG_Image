@@ -405,7 +405,8 @@ class Panel:
                                            fill=col, width=2)
             txt = self.canvas.create_text(e.x + 10, e.y - 12, text='',
                                           fill=col, anchor='w',
-                                          font=('Consolas', 12, 'bold'))
+                                          font=('Consolas', 12, 'bold'),
+                                          tags='lbl')
             self._drag = (e.x, e.y, line, txt)
         elif mode == 'bue':
             self._poly_add(e.x, e.y)
@@ -484,7 +485,7 @@ class Panel:
         k = len(P['segs']) + 1
         txt = self.canvas.create_text(
             0, 0, text=f'{k}: {L:.0f}px ({L*self.app.um_per_px:.0f}\u00b5m)',
-            fill='#ffd0d0', font=('Consolas', 9, 'bold'))
+            fill='#ffd0d0', font=('Consolas', 9, 'bold'), tags='lbl')
         bg = self.canvas.create_rectangle(0, 0, 0, 0, fill='#000000', outline='')
         self.canvas.tag_lower(bg, txt)
         P['segs'].append((bg, txt, L, (x0, y0, x1, y1)))
@@ -524,6 +525,47 @@ class Panel:
                                                       fill='#ff5b5b', width=2))
             self._seg_add(P, x0, y0, x, y)
 
+    def _place_summary(self, tid, pts, cx, cy):
+        """H/W/A 요약 상자가 변 길이 라벨을 가리지 않게 놓는다.
+        다각형이 상자보다 넉넉히 크면 안쪽(무게중심)에, 아니면 바깥 4방향
+        (오른쪽·왼쪽·아래·위) 중 캔버스 안에 들어가고 다른 라벨('lbl' 태그)과
+        안 겹치는 첫 자리에. 반환: 안쪽에 놓였으면 True"""
+        x0, y0, x1, y1 = self.canvas.bbox(tid)
+        bw, bh = x1 - x0, y1 - y0
+        xs = [x for x, _ in pts]; ys = [y for _, y in pts]
+        px0, py0, px1, py1 = min(xs), min(ys), max(xs), max(ys)
+        if px1 - px0 >= bw + 24 and py1 - py0 >= bh + 24:
+            return True                                # 안쪽 그대로
+        cw, ch = int(self.canvas['width']), int(self.canvas['height'])   # 그리기 영역
+        others = [self.canvas.bbox(i) for i in self.canvas.find_withtag('lbl')
+                  if i != tid]
+        gap = 36                                       # 변 라벨(16px 띄움) 바깥
+
+        def clamp(x, y):                               # 상자를 캔버스 안으로
+            return (min(max(x, bw / 2), cw - bw / 2),
+                    min(max(y, bh / 2), ch - bh / 2))
+
+        cands = []                                     # 4방향 → 대각선 → 더 멀리
+        for g in (gap, gap + 44):
+            R, Lf = px1 + g + bw / 2, px0 - g - bw / 2
+            B, T = py1 + g + bh / 2, py0 - g - bh / 2
+            cands += [clamp(R, cy), clamp(Lf, cy), clamp(cx, B), clamp(cx, T),
+                      clamp(R, T), clamp(R, B), clamp(Lf, T), clamp(Lf, B)]
+
+        def free(x, y):
+            r = (x - bw / 2, y - bh / 2, x + bw / 2, y + bh / 2)
+            if r[0] < 0 or r[1] < 0 or r[2] > cw or r[3] > ch:
+                return False
+            return not any(r[0] < o[2] + 2 and r[2] > o[0] - 2 and
+                           r[1] < o[3] + 2 and r[3] > o[1] - 2 for o in others)
+
+        for x, y in cands:
+            if free(x, y):
+                self.canvas.coords(tid, x, y)
+                return False
+        self.canvas.coords(tid, *cands[0])             # 모두 막히면 오른쪽
+        return False
+
     def poly_close(self, _=None):
         """우클릭 → 다각형 확정: 채우기 + 높이/밑변/면적 표시"""
         P = self._poly
@@ -536,8 +578,6 @@ class Panel:
                                           stipple='gray25',
                                           outline='#ff5b5b', width=2)
         self._seg_add(P, *pts[-1], *pts[0])            # 닫는 변 (마지막 → 첫 꼭짓점)
-        for sbg, stxt, _, _ in P['segs']:              # 라벨을 채우기 위로
-            self.canvas.tag_raise(sbg); self.canvas.tag_raise(stxt)
         # --- 원본 픽셀 좌표로 환산해 계측 ---
         sp = [self._to_src(x, y) for (x, y) in pts]
         xs = [a for a, _ in sp];  ys = [b for _, b in sp]
@@ -556,12 +596,22 @@ class Panel:
         cy = sum(y for _, y in pts) / len(pts)
         tid = self.canvas.create_text(cx, cy, text=txt, fill='#ffffff',
                                       font=('Consolas', 10, 'bold'),
-                                      justify='center')
+                                      justify='center', tags='lbl')
+        inside = self._place_summary(tid, pts, cx, cy)   # 변 라벨을 가리지 않는 자리로
         bg = self.canvas.create_rectangle(self.canvas.bbox(tid),
                                           fill='#000000', outline='')
         self.canvas.tag_lower(bg, tid)
+        extra = [poly, bg, tid]
+        if not inside:                                 # 상자 → 무게중심 점선 연결
+            bx0, by0, bx1, by1 = self.canvas.bbox(tid)
+            link = self.canvas.create_line((bx0 + bx1) / 2, (by0 + by1) / 2,
+                                           cx, cy, fill='#ffffff', dash=(2, 3))
+            self.canvas.tag_lower(link, bg)
+            extra.append(link)
+        for sbg, stxt, _, _ in P['segs']:              # 변 라벨은 항상 맨 위
+            self.canvas.tag_raise(sbg); self.canvas.tag_raise(stxt)
         self.canvas.delete(P['preview']); self.canvas.delete(P['preview_txt'])
-        self.meas_items += P['items'] + [poly, bg, tid]
+        self.meas_items += P['items'] + extra
         self._poly = None
         # 메모장에 자동 기록 (변 길이는 꼭짓점을 찍은 순서대로 1, 2, … 마지막이 닫는 변)
         segs = ' '.join(f'{k}={L:.0f}px({L*um:.0f}um)'
