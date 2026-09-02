@@ -13,7 +13,8 @@
 
  [재생]  패널별 재생/정지/1프레임/슬라이더 완전 독립
          + 하단의 동시 재생/정지/1프레임/처음
-         컬러 센서(Bayer) 자동 복원 (WB+디모자이크+감마 LUT)
+         컬러 센서(Bayer) 자동 복원 (WB+게인+EA 디모자이크+감마 LUT)
+         밝기 게인(자동) · 노이즈 감소 옵션, 흑백도 디모자이크 후 변환
 
  · 의존: Python 3.8+, Pillow, numpy, opencv-python, pycine
 ============================================================
@@ -49,6 +50,8 @@ PANEL_SIZE   = 560        # 각 패널 '초기' 표시 크기 [px] — 창을 �
 PANEL_MIN    = 320        # 최소 패널 크기
 FPS_LIST     = [60, 30, 15, 5, 2, 1]
 DEFAULT_FPS  = 30
+DEFAULT_GAIN = 4.0        # 밝기 게인 초기값 — 이 데이터셋은 12-bit 중 상위 ~21% 만 쓰여
+                          #   어둡게 보이므로 LUT 에서 증폭. [자동] 버튼이 현재 프레임에 맞춤.
 HOT_THR      = 120        # 핫픽셀 판정 문턱 [DN] — 같은 색 이웃 중앙값보다
                           #   이만큼 밝으면 '반짝이'로 보고 이웃값으로 치환.
                           #   남으면 80 으로 낮추고, 실제 스펙클까지 지워지면 200 으로.
@@ -87,6 +90,8 @@ class CineReader:
         self._gen = None
         self._pos = -1
         self._lut = None
+        self.gain = 1.0               # 밝기 게인 (LUT 에 반영)
+        self.last_raw = None          # 마지막으로 읽은 raw 프레임 (자동 게인 계산용)
 
     def _open_at(self, idx):
         from pycine.raw import read_frames
@@ -100,6 +105,7 @@ class CineReader:
         try:
             fr = next(self._gen)
             self._pos = idx + 1
+            self.last_raw = fr
             return fr
         except StopIteration:
             self._gen = None
@@ -107,7 +113,7 @@ class CineReader:
 
     def _build_luts(self):
         maxv = (1 << self.bpp) - 1
-        x = np.linspace(0.0, 1.0, maxv + 1)
+        x = np.linspace(0.0, 1.0, maxv + 1) * self.gain
         gamma = float(getattr(self.setup, 'fGamma', 2.2)) or 2.2
         g = lambda v: np.clip(255.0 * np.power(np.clip(v, 0, 1), 1.0 / gamma),
                               0, 255).astype(np.uint8)
@@ -119,6 +125,12 @@ class CineReader:
             rG, bG = 1.0, 1.0
         self._lutR = g(x * rG)          # WB 를 감마 LUT 에 합침 (정수 인덱싱만)
         self._lutB = g(x * bG)
+
+    def set_gain(self, gain):
+        """밝기 게인 — LUT 에 곱해 두므로 프레임당 비용 0. bpp 를 알기 전이면 값만 저장."""
+        self.gain = float(gain)
+        if self.bpp is not None:
+            self._build_luts()
 
     @staticmethod
     def _despeckle(raw):
@@ -135,7 +147,18 @@ class CineReader:
         out[hot] = med[hot].astype(raw.dtype)
         return out
 
-    def to_rgb8(self, fr, color=True, despeckle=True):
+    @staticmethod
+    def _denoise(rgb, color):
+        """노이즈 감소 (~8 ms) — 휘도는 에지 보존 bilateral, 색차는 가우시안(컬러 얼룩 제거)"""
+        if not color:
+            g = cv2.bilateralFilter(rgb[..., 0], 5, 25, 5)
+            return cv2.cvtColor(g, cv2.COLOR_GRAY2RGB)
+        ycc = cv2.cvtColor(rgb, cv2.COLOR_RGB2YCrCb)
+        y = cv2.bilateralFilter(ycc[..., 0], 5, 25, 5)
+        c = cv2.GaussianBlur(ycc[..., 1:], (7, 7), 0)
+        return cv2.cvtColor(np.dstack([y, c]), cv2.COLOR_YCrCb2RGB)
+
+    def to_rgb8(self, fr, color=True, despeckle=True, denoise=True):
         if self.bpp is None:
             self.bpp = 12
         if self._lut is None:
@@ -143,15 +166,23 @@ class CineReader:
         maxv = (1 << self.bpp) - 1
         if despeckle:
             fr = self._despeckle(fr)
-        if self.cfa == 0 or not color:
-            g = self._lut[np.minimum(fr, maxv)]
-            return cv2.cvtColor(g, cv2.COLOR_GRAY2RGB)
         raw16 = np.minimum(fr, maxv).astype(np.uint16, copy=False)
-        rgb = cv2.cvtColor(raw16, cv2.COLOR_BAYER_GB2RGB)
-        out = np.empty(rgb.shape, np.uint8)
-        out[..., 0] = self._lutR[rgb[..., 0]]
-        out[..., 1] = self._lut[rgb[..., 1]]
-        out[..., 2] = self._lutB[rgb[..., 2]]
+        if self.cfa == 0:                                   # 모노 센서
+            out = cv2.cvtColor(self._lut[raw16], cv2.COLOR_GRAY2RGB)
+            color = False
+        else:
+            # 흑백 표시도 디모자이크를 거친다 — raw Bayer 에 바로 LUT 를 씌우면
+            # R/G/B 픽셀 감도 차이(WB 1.8배)가 격자 무늬 노이즈로 보였음
+            rgb = cv2.cvtColor(raw16, cv2.COLOR_BAYER_GB2RGB_EA)   # 에지 보존 디모자이크
+            out = np.empty(rgb.shape, np.uint8)
+            out[..., 0] = self._lutR[rgb[..., 0]]
+            out[..., 1] = self._lut[rgb[..., 1]]
+            out[..., 2] = self._lutB[rgb[..., 2]]
+            if not color:
+                out = cv2.cvtColor(cv2.cvtColor(out, cv2.COLOR_RGB2GRAY),
+                                   cv2.COLOR_GRAY2RGB)
+        if denoise:
+            out = self._denoise(out, color)
         return out
 
 
@@ -393,9 +424,14 @@ class Panel:
                 txt, text=f'{ang:.1f}\u00b0  {L:.0f}px ({L*um:.0f}\u00b5m)')
             self.canvas.coords(txt, (x0 + e.x) / 2 + 12, (y0 + e.y) / 2 - 12)
         elif self._poly:
-            # 마지막 꼭짓점 → 마우스 미리보기 선
+            # 마지막 꼭짓점 → 마우스 미리보기 선 + 그 변의 길이
             px, py = self._poly['pts'][-1]
             self.canvas.coords(self._poly['preview'], px, py, e.x, e.y)
+            L = self._src_len(px, py, e.x, e.y)
+            self.canvas.itemconfig(
+                self._poly['preview_txt'],
+                text=f'{L:.0f}px ({L*self.app.um_per_px:.0f}\u00b5m)')
+            self.canvas.coords(self._poly['preview_txt'], e.x + 10, e.y - 6)
 
     def meas_release(self, e):
         if not self._drag:
@@ -434,11 +470,50 @@ class Panel:
             f'L={L:.0f}px ({L*um:.0f}um)')
 
     # ---- BUE 다각형: 좌클릭 = 꼭짓점 추가, 우클릭 = 닫기 ----
+    #   BUE 는 꼭짓점이 뚜렷하지 않은 뭉툭한 형상이라 변마다 길이를 따로 표시한다
+    #   (공구와 만나는 면의 길이, 경사면(rake)까지의 거리 등을 변 단위로 읽기 위함)
+    def _src_len(self, x0, y0, x1, y1):
+        """캔버스 두 점 사이 거리를 원본 픽셀 단위로"""
+        sx0, sy0 = self._to_src(x0, y0)
+        sx1, sy1 = self._to_src(x1, y1)
+        return math.hypot(sx1 - sx0, sy1 - sy0)
+
+    def _seg_add(self, P, x0, y0, x1, y1):
+        """변 (x0,y0)-(x1,y1) 의 길이 라벨 '번호: px (µm)' 을 만든다"""
+        L = self._src_len(x0, y0, x1, y1)
+        k = len(P['segs']) + 1
+        txt = self.canvas.create_text(
+            0, 0, text=f'{k}: {L:.0f}px ({L*self.app.um_per_px:.0f}\u00b5m)',
+            fill='#ffd0d0', font=('Consolas', 9, 'bold'))
+        bg = self.canvas.create_rectangle(0, 0, 0, 0, fill='#000000', outline='')
+        self.canvas.tag_lower(bg, txt)
+        P['segs'].append((bg, txt, L, (x0, y0, x1, y1)))
+        P['items'] += [bg, txt]
+        self._seg_place_all(P)
+
+    def _seg_place_all(self, P):
+        """모든 변 라벨을 변 중점에서 다각형 바깥쪽(무게중심 반대편)으로 띄워 놓는다"""
+        pts = P['pts']
+        cx = sum(x for x, _ in pts) / len(pts)
+        cy = sum(y for _, y in pts) / len(pts)
+        for bg, txt, _, (x0, y0, x1, y1) in P['segs']:
+            mx, my = (x0 + x1) / 2, (y0 + y1) / 2
+            dx, dy = x1 - x0, y1 - y0
+            n = math.hypot(dx, dy) or 1.0
+            nx, ny = -dy / n, dx / n                   # 변의 법선
+            if (mx - cx) * nx + (my - cy) * ny < 0:    # 무게중심 쪽을 향하면 뒤집기
+                nx, ny = -nx, -ny
+            self.canvas.coords(txt, mx + nx * 16, my + ny * 16)
+            self.canvas.coords(bg, *self.canvas.bbox(txt))
+
     def _poly_add(self, x, y):
         if self._poly is None:
             pv = self.canvas.create_line(x, y, x, y, fill='#ff5b5b',
                                          width=2, dash=(4, 3))
-            self._poly = {'pts': [], 'items': [], 'preview': pv}
+            pt = self.canvas.create_text(x, y, text='', fill='#ffd0d0',
+                                         anchor='sw', font=('Consolas', 9, 'bold'))
+            self._poly = {'pts': [], 'items': [], 'segs': [],
+                          'preview': pv, 'preview_txt': pt}
         P = self._poly
         P['pts'].append((x, y))
         P['items'].append(self.canvas.create_oval(x-3, y-3, x+3, y+3,
@@ -447,6 +522,7 @@ class Panel:
             (x0, y0) = P['pts'][-2]
             P['items'].append(self.canvas.create_line(x0, y0, x, y,
                                                       fill='#ff5b5b', width=2))
+            self._seg_add(P, x0, y0, x, y)
 
     def poly_close(self, _=None):
         """우클릭 → 다각형 확정: 채우기 + 높이/밑변/면적 표시"""
@@ -459,6 +535,9 @@ class Panel:
         poly = self.canvas.create_polygon(*flat, fill='#ff5b5b',
                                           stipple='gray25',
                                           outline='#ff5b5b', width=2)
+        self._seg_add(P, *pts[-1], *pts[0])            # 닫는 변 (마지막 → 첫 꼭짓점)
+        for sbg, stxt, _, _ in P['segs']:              # 라벨을 채우기 위로
+            self.canvas.tag_raise(sbg); self.canvas.tag_raise(stxt)
         # --- 원본 픽셀 좌표로 환산해 계측 ---
         sp = [self._to_src(x, y) for (x, y) in pts]
         xs = [a for a, _ in sp];  ys = [b for _, b in sp]
@@ -481,20 +560,23 @@ class Panel:
         bg = self.canvas.create_rectangle(self.canvas.bbox(tid),
                                           fill='#000000', outline='')
         self.canvas.tag_lower(bg, tid)
-        self.canvas.delete(P['preview'])
+        self.canvas.delete(P['preview']); self.canvas.delete(P['preview_txt'])
         self.meas_items += P['items'] + [poly, bg, tid]
         self._poly = None
-        # 메모장에 자동 기록
+        # 메모장에 자동 기록 (변 길이는 꼭짓점을 찍은 순서대로 1, 2, … 마지막이 닫는 변)
+        segs = ' '.join(f'{k}={L:.0f}px({L*um:.0f}um)'
+                        for k, (_, _, L, _) in enumerate(P['segs'], 1))
         self.app.log_memo(
             f'[{self.side}] {os.path.basename(self.reader.path) if self.reader else "?"} '
             f'fr{self.i+1}  BUE H={h_px:.0f}px({h_px*um:.0f}um) '
-            f'W={w_px:.0f}px({w_px*um:.0f}um) A={area:.0f}px2')
+            f'W={w_px:.0f}px({w_px*um:.0f}um) A={area:.0f}px2  변: {segs}')
 
     def poly_cancel(self, _=None):
         if self._poly:
             for it in self._poly['items']:
                 self.canvas.delete(it)
             self.canvas.delete(self._poly['preview'])
+            self.canvas.delete(self._poly['preview_txt'])
             self._poly = None
 
     def meas_clear(self):
@@ -562,6 +644,7 @@ class Panel:
         except Exception as e:
             self.lbl_file.config(text=f'열기 실패: {e}')
             return
+        self.reader.set_gain(self.app.gain_value)
         self.i = 0
         self.sld.config(to=self.reader.n - 1)
         fps = self.reader.fps
@@ -700,6 +783,7 @@ class App:
                            anchor='w', font=('Malgun Gothic', 9)
                            ).pack(fill='x', padx=14)
         tk.Label(side, text='BUE: 좌클릭=꼭짓점, 우클릭=완성\n'
+                 '     변마다 길이(px/\u00b5m) 표시\n'
                  '보정: 절삭깊이(100µm) 구간을 드래그',
                  bg=C_PANEL, fg=C_SUB, anchor='w', justify='left',
                  font=('Malgun Gothic', 8)).pack(fill='x', padx=14)
@@ -730,18 +814,40 @@ class App:
                                 font=('Consolas', 11, 'bold'))
         self.lbl_fps.pack()
 
+        # --- 밝기 (게인) — 어두운 촬영본을 LUT 단계에서 증폭 (프레임당 비용 0) ---
+        sec('밝기')
+        self.gain_value = float(DEFAULT_GAIN)
+        self._gain_job = None
+        self._gain_guard = False
+        self.sld_gain = ttk.Scale(side, from_=1, to=8, length=150,
+                                  value=DEFAULT_GAIN, command=self.on_gain)
+        self.sld_gain.pack(fill='x', padx=12)
+        grow = tk.Frame(side, bg=C_PANEL)
+        grow.pack(fill='x', padx=10)
+        self.lbl_gain = tk.Label(grow, text=f'x{DEFAULT_GAIN:.1f}',
+                                 bg=C_PANEL, fg=C_FG,
+                                 font=('Consolas', 11, 'bold'))
+        self.lbl_gain.pack(side='left', expand=True)
+        tk.Button(grow, text='자동', command=self.auto_gain, bd=0, relief='flat',
+                  cursor='hand2', bg=C_BTN, fg=C_FG, padx=10, pady=2,
+                  activebackground=C_BTN_HI, activeforeground=C_FG,
+                  font=('Malgun Gothic', 9)).pack(side='right')
+
         # --- 옵션 ---
         sec('옵션')
         self.var_loop = tk.BooleanVar(value=True)
         self.var_pix = tk.BooleanVar(value=False)
         self.var_color = tk.BooleanVar(value=True)
         self.var_despk = tk.BooleanVar(value=True)
+        self.var_denoise = tk.BooleanVar(value=True)
         for txt, var in (('루프', self.var_loop), ('픽셀 선명', self.var_pix),
                          ('컬러', self.var_color),
-                         ('반짝이 제거', self.var_despk)):
+                         ('반짝이 제거', self.var_despk),
+                         ('노이즈 감소', self.var_denoise)):
             tk.Checkbutton(side, text=txt, variable=var, bg=C_PANEL, fg=C_FG,
                            selectcolor=C_BTN, activebackground=C_PANEL,
                            activeforeground=C_FG, anchor='w',
+                           command=self.redraw_all,       # 토글 즉시 현재 프레임 갱신
                            font=('Malgun Gothic', 9)).pack(fill='x', padx=14)
 
         # ===== 메모장: 우측 컬럼 하단 (남는 공간 전부) =====
@@ -887,6 +993,50 @@ class App:
         self.fps_value = max(1.0, float(v))
         self.lbl_fps.config(text=f'{self.fps_value:.0f} fps')
 
+    # ---- 밝기 ----
+    def on_gain(self, v):
+        if self._gain_guard:                  # auto_gain 이 슬라이더 위치만 맞출 때
+            return
+        self.gain_value = max(1.0, float(v))
+        self.lbl_gain.config(text=f'x{self.gain_value:.1f}')
+        if self._gain_job:
+            self.tk.after_cancel(self._gain_job)
+        self._gain_job = self.tk.after(80, self._apply_gain)     # 드래그 디바운스
+
+    def _apply_gain(self):
+        self._gain_job = None
+        for p in (self.L, self.R):
+            if p.reader:
+                p.reader.set_gain(self.gain_value)
+        self.redraw_all()
+
+    def auto_gain(self):
+        """패널별로 현재 프레임의 상위 0.3% 가 흰색이 되도록 게인을 맞춘다 (좌우 따로).
+           슬라이더를 직접 움직이면 다시 양쪽 공통 값이 된다."""
+        gains = []
+        for p in (self.L, self.R):
+            r = p.reader
+            if r and r.last_raw is not None and r.bpp:
+                raw = r._despeckle(r.last_raw)           # 핫픽셀이 상위 0.3% 를 끌어올리므로 제외
+                p997 = float(np.percentile(raw, 99.7))
+                g = min(8.0, max(1.0, ((1 << r.bpp) - 1) / max(p997, 1.0)))
+                r.set_gain(g)
+                gains.append(g)
+        if not gains:
+            return
+        self.gain_value = gains[0]
+        self._gain_guard = True                  # 슬라이더 위치만 맞추고 재적용은 안 함
+        self.sld_gain.set(gains[0])
+        self._gain_guard = False
+        self.lbl_gain.config(text=' | '.join(f'x{g:.1f}' for g in gains))
+        self.redraw_all()
+
+    def redraw_all(self):
+        """옵션/게인이 바뀌면 멈춰 있는 현재 프레임을 다시 그린다"""
+        for p in (self.L, self.R):
+            if p.reader:
+                p.want_seek = p.i
+
     def update_buttons(self):
         self.L.btn_play.config(text='⏸' if self.L.playing else '▶')
         self.R.btn_play.config(text='⏸' if self.R.playing else '▶')
@@ -953,7 +1103,8 @@ class App:
         if fr is None:
             return
         rgb = r.to_rgb8(fr, color=self.var_color.get(),
-                        despeckle=self.var_despk.get())
+                        despeckle=self.var_despk.get(),
+                        denoise=self.var_denoise.get())
         interp = cv2.INTER_NEAREST if self.var_pix.get() else cv2.INTER_LANCZOS4
         ps = self.panel_size
         h, w = rgb.shape[:2]
