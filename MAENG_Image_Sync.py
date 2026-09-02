@@ -81,6 +81,7 @@ class CineReader:
         h = read_header(path)
         self.n = int(h['cinefileheader'].ImageCount)
         self.setup = h['setup']
+        self.fps = float(self.setup.FrameRate or self.setup.FrameRate16 or 0)   # 촬영 fps (시각 표시용)
         self.cfa = int(self.setup.CFA)
         self.bpp = None
         self._gen = None
@@ -265,6 +266,7 @@ class Panel:
         self.want_seek = None
         self.t_last = None            # 실시간 재생 기준 시각 (프레임 스킵용)
         self._sld_guard = False
+        self.t_dec = 0                # 시각 표시 소수 자릿수 (촬영 fps 로 결정)
 
         f = tk.Frame(parent, bg=C_PANEL, highlightthickness=1,
                      highlightbackground=C_LINE)
@@ -344,13 +346,19 @@ class Panel:
                   bd=0, relief='flat', cursor='hand2', bg=C_BTN, fg=C_FG,
                   activebackground=C_BTN_HI, activeforeground=C_FG,
                   font=('Malgun Gothic', 9)).pack(side='right')
+        # ★ 현재 프레임의 실제 시각 [s] = (프레임번호−1) / 촬영 fps — 슬라이더 바로 옆
+        self.lbl_t = tk.Label(row, text='', width=9, anchor='e',
+                              bg=C_PANEL, fg=accent,
+                              font=('Consolas', 10, 'bold'))
+        self.lbl_t.pack(side='right', padx=(6, 4))
 
     # ---- 측정 도구 (각도 / BUE 크기 — 모드로 완전 분리) ----
     @staticmethod
     def _angle_of(x0, y0, x1, y1):
-        """수평선 기준 각도 [0~180°). 화면 y 는 아래로 증가하므로 부호 반전."""
-        ang = math.degrees(math.atan2(-(y1 - y0), (x1 - x0)))
-        return ang % 180.0
+        """수평선 기준 예각 [0~90°] — 전단각. 화면 y 는 아래로 증가하므로 부호 반전.
+        선을 어느 방향으로 긋든, 어느 쪽으로 기울든 같은 값이 나온다."""
+        ang = math.degrees(math.atan2(-(y1 - y0), (x1 - x0))) % 180.0
+        return 180.0 - ang if ang > 90.0 else ang
 
     def _to_src(self, x, y):
         """캔버스 좌표 → 원본 이미지 픽셀 좌표"""
@@ -556,8 +564,13 @@ class Panel:
             return
         self.i = 0
         self.sld.config(to=self.reader.n - 1)
+        fps = self.reader.fps
+        # 소수 자릿수: 1프레임 차이가 보이도록 (2000fps → 0.0005s → 4자리)
+        self.t_dec = max(1, min(6, math.ceil(math.log10(fps)))) if fps > 0 else 0
         self.lbl_file.config(
-            text=f'{os.path.basename(path)}   ({self.reader.n}프레임)')
+            text=f'{os.path.basename(path)}   ({self.reader.n}프레임'
+                 + (f' · {fps:g}fps' if fps > 0 else '') + ')')
+        self.lbl_t.config(text='')
         self.want_seek = 0
 
     # ---- 재생 조작 ----
@@ -597,6 +610,8 @@ class Panel:
         self._photo = photo
         self.canvas.itemconfig(self._imgid, image=photo)
         self.lbl.config(text=f'{idx + 1}/{self.reader.n}')
+        if self.reader.fps > 0:
+            self.lbl_t.config(text=f'{idx / self.reader.fps:.{self.t_dec}f}s')
         self._sld_guard = True
         self.sld.set(idx)
         self._sld_guard = False
