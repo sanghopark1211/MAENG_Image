@@ -34,7 +34,17 @@ from PIL import Image, ImageTk
 
 # ===== 설정 =====================================================
 APP_NAME     = 'MAENG_Image_Sync'
-DEFAULT_ROOT = r"F:\실시간 재료거동\박상호\1) 압연재 조건별 비교 데이터\초고속 카메라 이미지 데이터"
+# 데이터 루트: 외장 드라이브 문자가 PC마다 달라(F:, I: …) 실행 시 드라이브를 훑어 찾는다
+DEFAULT_ROOT_REL = r"실시간 재료거동\박상호\1) 압연재 조건별 비교 데이터\초고속 카메라 이미지 데이터"
+
+def find_default_root():
+    for d in 'CDEFGHIJKLMNOPQRSTUVWXYZ':
+        p = f'{d}:' + os.sep + DEFAULT_ROOT_REL
+        if os.path.isdir(p):
+            return p
+    return ''
+
+DEFAULT_ROOT = find_default_root()
 PANEL_SIZE   = 560        # 각 패널 '초기' 표시 크기 [px] — 창을 키우면 자동 확대
 PANEL_MIN    = 320        # 최소 패널 크기
 FPS_LIST     = [60, 30, 15, 5, 2, 1]
