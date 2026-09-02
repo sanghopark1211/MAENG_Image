@@ -14,7 +14,8 @@
  [재생]  패널별 재생/정지/1프레임/슬라이더 완전 독립
          + 하단의 동시 재생/정지/1프레임/처음
          컬러 센서(Bayer) 자동 복원 (WB+게인+EA 디모자이크+감마 LUT)
-         밝기 게인(자동) · 노이즈 감소 옵션, 흑백도 디모자이크 후 변환
+         밝기 게인(자동) · 핫픽셀(반짝이) 항상 제거 · 흑백도 디모자이크 후 변환
+         자유면 높이 맞추기: 두 영상의 자유면을 같은 높이로 (배율 유지, 세로 이동만)
 
  · 의존: Python 3.8+, Pillow, numpy, opencv-python, pycine
 ============================================================
@@ -147,42 +148,26 @@ class CineReader:
         out[hot] = med[hot].astype(raw.dtype)
         return out
 
-    @staticmethod
-    def _denoise(rgb, color):
-        """노이즈 감소 (~8 ms) — 휘도는 에지 보존 bilateral, 색차는 가우시안(컬러 얼룩 제거)"""
-        if not color:
-            g = cv2.bilateralFilter(rgb[..., 0], 5, 25, 5)
-            return cv2.cvtColor(g, cv2.COLOR_GRAY2RGB)
-        ycc = cv2.cvtColor(rgb, cv2.COLOR_RGB2YCrCb)
-        y = cv2.bilateralFilter(ycc[..., 0], 5, 25, 5)
-        c = cv2.GaussianBlur(ycc[..., 1:], (7, 7), 0)
-        return cv2.cvtColor(np.dstack([y, c]), cv2.COLOR_YCrCb2RGB)
-
-    def to_rgb8(self, fr, color=True, despeckle=True, denoise=True):
+    def to_rgb8(self, fr, color=True):
         if self.bpp is None:
             self.bpp = 12
         if self._lut is None:
             self._build_luts()
         maxv = (1 << self.bpp) - 1
-        if despeckle:
-            fr = self._despeckle(fr)
+        fr = self._despeckle(fr)                            # 핫픽셀(반짝이)은 항상 제거
         raw16 = np.minimum(fr, maxv).astype(np.uint16, copy=False)
         if self.cfa == 0:                                   # 모노 센서
-            out = cv2.cvtColor(self._lut[raw16], cv2.COLOR_GRAY2RGB)
-            color = False
-        else:
-            # 흑백 표시도 디모자이크를 거친다 — raw Bayer 에 바로 LUT 를 씌우면
-            # R/G/B 픽셀 감도 차이(WB 1.8배)가 격자 무늬 노이즈로 보였음
-            rgb = cv2.cvtColor(raw16, cv2.COLOR_BAYER_GB2RGB_EA)   # 에지 보존 디모자이크
-            out = np.empty(rgb.shape, np.uint8)
-            out[..., 0] = self._lutR[rgb[..., 0]]
-            out[..., 1] = self._lut[rgb[..., 1]]
-            out[..., 2] = self._lutB[rgb[..., 2]]
-            if not color:
-                out = cv2.cvtColor(cv2.cvtColor(out, cv2.COLOR_RGB2GRAY),
-                                   cv2.COLOR_GRAY2RGB)
-        if denoise:
-            out = self._denoise(out, color)
+            return cv2.cvtColor(self._lut[raw16], cv2.COLOR_GRAY2RGB)
+        # 흑백 표시도 디모자이크를 거친다 — raw Bayer 에 바로 LUT 를 씌우면
+        # R/G/B 픽셀 감도 차이(WB 1.8배)가 격자 무늬 노이즈로 보였음
+        rgb = cv2.cvtColor(raw16, cv2.COLOR_BAYER_GB2RGB_EA)   # 에지 보존 디모자이크
+        out = np.empty(rgb.shape, np.uint8)
+        out[..., 0] = self._lutR[rgb[..., 0]]
+        out[..., 1] = self._lut[rgb[..., 1]]
+        out[..., 2] = self._lutB[rgb[..., 2]]
+        if not color:
+            out = cv2.cvtColor(cv2.cvtColor(out, cv2.COLOR_RGB2GRAY),
+                               cv2.COLOR_GRAY2RGB)
         return out
 
 
@@ -298,6 +283,9 @@ class Panel:
         self.t_last = None            # 실시간 재생 기준 시각 (프레임 스킵용)
         self._sld_guard = False
         self.t_dec = 0                # 시각 표시 소수 자릿수 (촬영 fps 로 결정)
+        self.free_y = None            # 자유면 위치 [원본 px, y] — '자유면 높이 맞추기'로 지정
+        self.y_shift = 0.0            # 세로 이동량 [원본 px] — 배율은 그대로, 위치만
+        self.free_items = []          # 자유면 점선/라벨 캔버스 아이템
 
         f = tk.Frame(parent, bg=C_PANEL, highlightthickness=1,
                      highlightbackground=C_LINE)
@@ -343,7 +331,7 @@ class Panel:
         self.canvas.bind('<B1-Motion>', self.meas_drag)
         self.canvas.bind('<Motion>', self.meas_drag)
         self.canvas.bind('<ButtonRelease-1>', self.meas_release)
-        self.canvas.bind('<ButtonPress-3>', self.poly_close)   # 우클릭 = 다각형 닫기
+        self.canvas.bind('<ButtonPress-3>', self.on_right)     # 우클릭 = 다각형 닫기 / 자유면 취소
 
         # --- 재생 줄 ---
         row = tk.Frame(f, bg=C_PANEL)
@@ -398,6 +386,12 @@ class Panel:
         return (x - ox) / sc, (y - oy) / sc
 
     def meas_press(self, e):
+        if self.app.free_pick:                     # '자유면 높이 맞추기' 클릭 대기 중
+            if self.reader:
+                self.free_y = self._to_src(e.x, e.y)[1]
+                self._draw_free_line()
+                self.app.free_picked(self)
+            return
         mode = self.app.var_mode.get()
         if mode in ('angle', 'cal'):
             col = '#ffe14d' if mode == 'angle' else '#5bff8a'
@@ -629,6 +623,41 @@ class Panel:
             self.canvas.delete(self._poly['preview_txt'])
             self._poly = None
 
+    # ---- 자유면 (높이 맞추기) ----
+    def on_right(self, e):
+        if self.app.free_pick:
+            self.app.free_cancel()
+        else:
+            self.poly_close(e)
+
+    def shift_px(self):
+        """세로 이동량 [화면 px]"""
+        return round(self.y_shift * self.disp_scale)
+
+    def set_shift(self, y_shift):
+        """세로 이동 [원본 px] — 배율은 그대로. 이미 그린 측정선도 같이 옮긴다."""
+        dy = round(float(y_shift) * self.disp_scale) - self.shift_px()
+        self.y_shift = float(y_shift)
+        if dy:
+            for it in self.meas_items:
+                self.canvas.move(it, 0, dy)
+        if self.reader:
+            self.want_seek = self.i              # 새 위치로 다시 그림 (disp_off 갱신)
+
+    def _draw_free_line(self):
+        """자유면 점선 — 이미지가 이동/재배율돼도 원본 좌표를 따라간다"""
+        for it in self.free_items:
+            self.canvas.delete(it)
+        self.free_items = []
+        if self.free_y is None:
+            return
+        y = self.disp_off[1] + self.free_y * self.disp_scale
+        w = int(self.canvas['width'])
+        self.free_items = [
+            self.canvas.create_line(0, y, w, y, fill='#5bff8a', width=1, dash=(6, 4)),
+            self.canvas.create_text(4, y - 2, text='자유면', fill='#5bff8a',
+                                    anchor='sw', font=('Malgun Gothic', 8))]
+
     def meas_clear(self):
         for it in self.meas_items:
             self.canvas.delete(it)
@@ -742,6 +771,9 @@ class Panel:
         self.i = idx
         self._photo = photo
         self.canvas.itemconfig(self._imgid, image=photo)
+        ps = self.app.panel_size
+        self.canvas.coords(self._imgid, ps // 2, ps // 2 + self.shift_px())   # 세로 이동 반영
+        self._draw_free_line()
         self.lbl.config(text=f'{idx + 1}/{self.reader.n}')
         if self.reader.fps > 0:
             self.lbl_t.config(text=f'{idx / self.reader.fps:.{self.t_dec}f}s')
@@ -888,17 +920,25 @@ class App:
         self.var_loop = tk.BooleanVar(value=True)
         self.var_pix = tk.BooleanVar(value=False)
         self.var_color = tk.BooleanVar(value=True)
-        self.var_despk = tk.BooleanVar(value=True)
-        self.var_denoise = tk.BooleanVar(value=True)
-        for txt, var in (('루프', self.var_loop), ('픽셀 선명', self.var_pix),
-                         ('컬러', self.var_color),
-                         ('반짝이 제거', self.var_despk),
-                         ('노이즈 감소', self.var_denoise)):
+
+        def chk(txt, var):
             tk.Checkbutton(side, text=txt, variable=var, bg=C_PANEL, fg=C_FG,
                            selectcolor=C_BTN, activebackground=C_PANEL,
                            activeforeground=C_FG, anchor='w',
                            command=self.redraw_all,       # 토글 즉시 현재 프레임 갱신
                            font=('Malgun Gothic', 9)).pack(fill='x', padx=14)
+
+        chk('루프', self.var_loop)
+        # ★ 자유면 높이 맞추기 — 두 영상의 자유면이 같은 높이에 오도록 세로 위치만
+        #   이동(배율 유지). 누른 뒤 좌·우 패널에서 자유면을 한 번씩 클릭.
+        self.free_pick = False
+        self._free_done = set()
+        self.btn_free = sbtn('↕ 자유면 높이 맞추기', self.free_start)
+        tk.Label(side, text='누른 뒤 좌·우 패널의 자유면 클릭\n우클릭 = 취소 · 위치 초기화',
+                 bg=C_PANEL, fg=C_SUB, anchor='w', justify='left',
+                 font=('Malgun Gothic', 8)).pack(fill='x', padx=14)
+        chk('픽셀 선명', self.var_pix)
+        chk('컬러', self.var_color)
 
         # ===== 메모장: 우측 컬럼 하단 (남는 공간 전부) =====
         sec('📝 메모 (자동 저장)')
@@ -1087,6 +1127,51 @@ class App:
             if p.reader:
                 p.want_seek = p.i
 
+    # ---- 자유면 높이 맞추기 ----
+    def free_start(self):
+        """버튼: 클릭 대기 시작(다시 누르면 취소). 좌·우에서 자유면을 한 번씩 클릭하면 맞춘다."""
+        if self.free_pick:
+            self.free_cancel()
+            return
+        self.free_pick = True
+        self._free_done = set()
+        self.btn_free.config(text='자유면 클릭: 좌 → 우', bg=C_ACC_L)
+        for p in (self.L, self.R):
+            p.canvas.config(cursor='crosshair')
+
+    def free_picked(self, panel):
+        self._free_done.add(panel.side)
+        if self._free_done >= {'L', 'R'}:
+            self.free_align()
+            self._free_end()
+        else:
+            self.btn_free.config(text='자유면 클릭: ' + ('우' if panel.side == 'L' else '좌'))
+
+    def free_cancel(self):
+        """우클릭/버튼 재클릭: 대기 취소 + 세로 이동·자유면 표시 초기화"""
+        for p in (self.L, self.R):
+            p.free_y = None
+            p._draw_free_line()
+            p.set_shift(0.0)
+        self._free_end()
+
+    def _free_end(self):
+        self.free_pick = False
+        self.btn_free.config(text='↕ 자유면 높이 맞추기', bg=C_BTN)
+        for p in (self.L, self.R):
+            p.canvas.config(cursor='')
+
+    def free_align(self):
+        """두 패널의 자유면이 같은 화면 높이에 오도록 각각 절반씩 세로 이동 (배율 불변)"""
+        L, R = self.L, self.R
+        if L.free_y is None or R.free_y is None or not (L.reader and R.reader):
+            return
+        ys = [p.disp_off[1] + p.free_y * p.disp_scale for p in (L, R)]   # 현재 화면 y
+        target = sum(ys) / 2
+        for p in (L, R):
+            base = p.disp_off[1] - p.shift_px()          # 이동 0 일 때의 이미지 상단
+            p.set_shift((target - base) / p.disp_scale - p.free_y)
+
     def update_buttons(self):
         self.L.btn_play.config(text='⏸' if self.L.playing else '▶')
         self.R.btn_play.config(text='⏸' if self.R.playing else '▶')
@@ -1152,9 +1237,7 @@ class App:
             return
         if fr is None:
             return
-        rgb = r.to_rgb8(fr, color=self.var_color.get(),
-                        despeckle=self.var_despk.get(),
-                        denoise=self.var_denoise.get())
+        rgb = r.to_rgb8(fr, color=self.var_color.get())
         interp = cv2.INTER_NEAREST if self.var_pix.get() else cv2.INTER_LANCZOS4
         ps = self.panel_size
         h, w = rgb.shape[:2]
@@ -1162,7 +1245,7 @@ class App:
         dw, dh = int(w * scale), int(h * scale)
         rgb = cv2.resize(rgb, (dw, dh), interpolation=interp)
         panel.disp_scale = scale                       # 측정 환산용
-        panel.disp_off = ((ps - dw) // 2, (ps - dh) // 2)
+        panel.disp_off = ((ps - dw) // 2, (ps - dh) // 2 + panel.shift_px())   # 세로 이동 포함
         try:
             self.q.put((panel, idx, Image.fromarray(rgb)), timeout=0.2)
         except queue.Full:
