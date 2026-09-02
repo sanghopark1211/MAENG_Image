@@ -51,11 +51,15 @@ PANEL_SIZE   = 560        # 각 패널 '초기' 표시 크기 [px] — 창을 �
 PANEL_MIN    = 320        # 최소 패널 크기
 FPS_LIST     = [60, 30, 15, 5, 2, 1]
 DEFAULT_FPS  = 30
-DEFAULT_GAIN = 4.0        # 밝기 게인 초기값 — 이 데이터셋은 12-bit 중 상위 ~21% 만 쓰여
-                          #   어둡게 보이므로 LUT 에서 증폭. [자동] 버튼이 현재 프레임에 맞춤.
-HOT_THR      = 120        # 핫픽셀 판정 문턱 [DN] — 같은 색 이웃 중앙값보다
-                          #   이만큼 밝으면 '반짝이'로 보고 이웃값으로 치환.
-                          #   남으면 80 으로 낮추고, 실제 스펙클까지 지워지면 200 으로.
+DEFAULT_GAIN = 1.0        # 밝기 게인 초기값 = 무보정.
+                          #   파일마다 밝기가 크게 달라(1 m/min 은 x1.3, 30 m/min 은 x7 가
+                          #   적정) 고정값을 쓰면 한쪽이 하얗게 타버린다. 그래서 파일을
+                          #   열 때 첫 프레임 기준으로 자동 산출한다. [자동] 은 수동 재조정.
+HOT_THR      = 250        # 핫픽셀 판정 문턱 [DN] — 같은 색 이웃 '최대값'보다 이만큼
+                          #   밝은 고립 픽셀만 '반짝이'로 보고 치환한다.
+                          #   중앙값 기준(과거)은 가공 중 밝은 구간에서 실제 스펙클
+                          #   조직까지 1.9% 나 지워버렸다. 최대값 기준은 0.08% 만 건드림.
+                          #   반짝이가 남으면 낮추고, 조직이 뭉개지면 올린다.
 UM_PER_PX    = 2.20       # ★ 1픽셀당 실제 길이 [um/px] — 모든 측정의 환산 계수.
                           #   근거(실측): 1 m/min 영상에서 공작물 이동 3.79 px/frame,
                           #   2000fps 이므로 8.333 um/frame -> 8.333/3.79 = 2.20 um/px
@@ -136,25 +140,26 @@ class CineReader:
     @staticmethod
     def _despeckle(raw):
         """핫픽셀(반짝이) 제거 — 디모자이크 '전' raw Bayer 에서.
-        같은 색 이웃(±2px 상하좌우)의 중앙값보다 HOT_THR 이상 밝은
-        '고립된 한 픽셀'만 이웃값으로 치환한다. 진짜 스펙클 하이라이트는
-        여러 픽셀 덩어리라 이웃도 밝으므로 건드리지 않는다."""
+        같은 색 이웃(±2px 상하좌우)의 '최대값'보다 HOT_THR 이상 밝은,
+        즉 모든 이웃보다 튀는 고립 픽셀만 치환한다. 진짜 스펙클은 이웃도
+        함께 밝아 판정에 걸리지 않는다 (중앙값 기준이면 지워졌음)."""
         pad = np.pad(raw, 2, mode='edge')
         nb = np.stack([pad[:-4, 2:-2], pad[4:, 2:-2],
                        pad[2:-2, :-4], pad[2:-2, 4:]])   # 같은 Bayer 색 이웃 4개
-        med = np.median(nb, axis=0)
-        hot = raw.astype(np.int32) - med > HOT_THR
+        ref = nb.max(axis=0)                             # ★ 최대값 기준
+        hot = raw.astype(np.int32) - ref > HOT_THR
         out = raw.copy()
-        out[hot] = med[hot].astype(raw.dtype)
+        out[hot] = ref[hot].astype(raw.dtype)
         return out
 
-    def to_rgb8(self, fr, color=True):
+    def to_rgb8(self, fr, color=True, despeckle=True):
         if self.bpp is None:
             self.bpp = 12
         if self._lut is None:
             self._build_luts()
         maxv = (1 << self.bpp) - 1
-        fr = self._despeckle(fr)                            # 핫픽셀(반짝이)은 항상 제거
+        if despeckle:
+            fr = self._despeckle(fr)                        # 핫픽셀(반짝이) 제거
         raw16 = np.minimum(fr, maxv).astype(np.uint16, copy=False)
         if self.cfa == 0:                                   # 모노 센서
             return cv2.cvtColor(self._lut[raw16], cv2.COLOR_GRAY2RGB)
@@ -283,6 +288,7 @@ class Panel:
         self.t_last = None            # 실시간 재생 기준 시각 (프레임 스킵용)
         self._sld_guard = False
         self.t_dec = 0                # 시각 표시 소수 자릿수 (촬영 fps 로 결정)
+        self.auto_gain_pending = False # 파일을 연 직후 첫 프레임에서 게인 자동 산출
         self.free_y = None            # 자유면 위치 [원본 px, y] — '자유면 높이 맞추기'로 지정
         self.y_shift = 0.0            # 세로 이동량 [원본 px] — 배율은 그대로, 위치만
         self.free_items = []          # 자유면 점선/라벨 캔버스 아이템
@@ -649,8 +655,8 @@ class Panel:
         for it in self.free_items:
             self.canvas.delete(it)
         self.free_items = []
-        if self.free_y is None:
-            return
+        if self.free_y is None or not self.app.free_show:
+            return                                   # 맞춘 뒤에는 선을 숨긴다
         y = self.disp_off[1] + self.free_y * self.disp_scale
         w = int(self.canvas['width'])
         self.free_items = [
@@ -724,6 +730,7 @@ class Panel:
             self.lbl_file.config(text=f'열기 실패: {e}')
             return
         self.reader.set_gain(self.app.gain_value)
+        self.auto_gain_pending = True        # 첫 프레임에서 밝기 자동 맞춤
         self.i = 0
         self.sld.config(to=self.reader.n - 1)
         fps = self.reader.fps
@@ -920,6 +927,7 @@ class App:
         self.var_loop = tk.BooleanVar(value=True)
         self.var_pix = tk.BooleanVar(value=False)
         self.var_color = tk.BooleanVar(value=True)
+        self.var_despk = tk.BooleanVar(value=True)   # 반짝이(핫픽셀) 제거
 
         def chk(txt, var):
             tk.Checkbutton(side, text=txt, variable=var, bg=C_PANEL, fg=C_FG,
@@ -933,12 +941,14 @@ class App:
         #   이동(배율 유지). 누른 뒤 좌·우 패널에서 자유면을 한 번씩 클릭.
         self.free_pick = False
         self._free_done = set()
+        self.free_show = True          # 자유면 점선 표시 여부 (맞추면 자동으로 꺼짐)
         self.btn_free = sbtn('↕ 자유면 높이 맞추기', self.free_start)
-        tk.Label(side, text='누른 뒤 좌·우 패널의 자유면 클릭\n우클릭 = 취소 · 위치 초기화',
+        tk.Label(side, text='누른 뒤 좌·우 패널의 자유면 클릭\n맞추면 점선은 자동으로 사라짐\n우클릭 = 취소 · 위치 초기화',
                  bg=C_PANEL, fg=C_SUB, anchor='w', justify='left',
                  font=('Malgun Gothic', 8)).pack(fill='x', padx=14)
         chk('픽셀 선명', self.var_pix)
         chk('컬러', self.var_color)
+        chk('반짝이 제거', self.var_despk)
 
         # ===== 메모장: 우측 컬럼 하단 (남는 공간 전부) =====
         sec('📝 메모 (자동 저장)')
@@ -1135,6 +1145,9 @@ class App:
             return
         self.free_pick = True
         self._free_done = set()
+        self.free_show = True                    # 다시 맞출 땐 선을 보여준다
+        for p in (self.L, self.R):
+            p._draw_free_line()
         self.btn_free.config(text='자유면 클릭: 좌 → 우', bg=C_ACC_L)
         for p in (self.L, self.R):
             p.canvas.config(cursor='crosshair')
@@ -1149,6 +1162,7 @@ class App:
 
     def free_cancel(self):
         """우클릭/버튼 재클릭: 대기 취소 + 세로 이동·자유면 표시 초기화"""
+        self.free_show = True
         for p in (self.L, self.R):
             p.free_y = None
             p._draw_free_line()
@@ -1171,6 +1185,11 @@ class App:
         for p in (L, R):
             base = p.disp_off[1] - p.shift_px()          # 이동 0 일 때의 이미지 상단
             p.set_shift((target - base) / p.disp_scale - p.free_y)
+        # 맞췄으면 안내용 점선은 지운다 (영상이 가려지지 않게).
+        # 다시 '자유면 높이 맞추기' 를 누르면 선이 돌아온다.
+        self.free_show = False
+        for p in (L, R):
+            p._draw_free_line()
 
     def update_buttons(self):
         self.L.btn_play.config(text='⏸' if self.L.playing else '▶')
@@ -1237,7 +1256,11 @@ class App:
             return
         if fr is None:
             return
-        rgb = r.to_rgb8(fr, color=self.var_color.get())
+        if panel.auto_gain_pending and r.bpp:
+            panel.auto_gain_pending = False
+            self._fit_gain(panel, fr)
+        rgb = r.to_rgb8(fr, color=self.var_color.get(),
+                        despeckle=self.var_despk.get())
         interp = cv2.INTER_NEAREST if self.var_pix.get() else cv2.INTER_LANCZOS4
         ps = self.panel_size
         h, w = rgb.shape[:2]
@@ -1250,6 +1273,25 @@ class App:
             self.q.put((panel, idx, Image.fromarray(rgb)), timeout=0.2)
         except queue.Full:
             pass
+
+    def _fit_gain(self, panel, raw):
+        """이 프레임의 상위 0.3% 가 흰색 직전에 오도록 게인 산출 (패널 독립).
+           촬영 조건마다 노출이 달라 — 1 m/min 은 x1.3, 30 m/min 은 x7 정도 —
+           공통 게인을 쓰면 한쪽이 포화된다."""
+        r = panel.reader
+        try:
+            base = r._despeckle(raw)          # 핫픽셀이 상위 백분위를 끌어올리므로 제외
+            p997 = float(np.percentile(base, 99.7))
+            g = min(8.0, max(1.0, ((1 << r.bpp) - 1) / max(p997, 1.0)))
+        except Exception:
+            return
+        r.set_gain(g)
+        self.tk.after(0, self._show_gain)
+
+    def _show_gain(self):
+        gs = [p.reader.gain for p in (self.L, self.R) if p.reader]
+        if gs:
+            self.lbl_gain.config(text=' | '.join(f'x{g:.1f}' for g in gs))
 
     def poll_queue(self):
         try:
