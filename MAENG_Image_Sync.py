@@ -25,8 +25,9 @@ import re
 import sys
 import math
 import time
-import queue
+import ctypes
 import threading
+from collections import deque
 import tkinter as tk
 from tkinter import ttk, filedialog, simpledialog
 
@@ -51,6 +52,11 @@ PANEL_SIZE   = 560        # 각 패널 '초기' 표시 크기 [px] — 창을 �
 PANEL_MIN    = 320        # 최소 패널 크기
 FPS_LIST     = [60, 30, 15, 5, 2, 1]
 DEFAULT_FPS  = 30
+DISPLAY_CAP  = 60         # 화면 갱신 상한 [Hz]. 모니터가 보통 60 Hz 라 그 이상
+                          #   만들어봐야 버려진다. 설정 fps 가 이보다 높으면
+                          #   프레임을 건너뛰어(stride) 시간 비율만 맞춘다.
+PREFETCH     = 3          # 미리 디코드해 둘 프레임 수. 디코드 시간 편차
+                          #   (4.5~20 ms)를 흡수해 표시 간격을 고르게 한다.
 DEFAULT_GAIN = 1.0        # 밝기 게인 = 1.0 (원본 그대로). 자동 보정은 하지 않는다 —
                           #   눈으로 보며 우측 '밝기' 슬라이더로 직접 맞춘다.
                           #   [자동] 버튼은 눌렀을 때만 현재 프레임에 맞춰준다.
@@ -287,7 +293,13 @@ class Panel:
         self.i_dec = 0                # 워커가 '마지막으로 디코드한' 번호.
                                       #   화면 표시용 self.i 는 메인 스레드가
                                       #   늦게 갱신하므로 재생 위치는 이걸 쓴다.
-        self.t_last = None            # 실시간 재생 기준 시각 (프레임 스킵용)
+        self.buf = deque()            # 프리페치: (표시예정시각, idx, PIL)
+        self.buf_lock = threading.Lock()
+        self.sched = None             # 다음에 만들 프레임의 표시 예정 시각
+        self.t_start = 0.0            # 재생 앵커: 시작 시각
+        self.i_start = 0.0            #            시작 프레임 번호
+        self.k = 0                    #            시작 이후 몇 번째 표시 프레임인지
+        self.fps_ref = None           # 앵커를 잡을 때의 fps (바뀌면 다시 잡는다)
         self._sld_guard = False
         self.t_dec = 0                # 시각 표시 소수 자릿수 (촬영 fps 로 결정)
         self.free_y = None            # 자유면 위치 [원본 px, y] — '자유면 높이 맞추기'로 지정
@@ -732,6 +744,8 @@ class Panel:
             return
         self.reader.set_gain(self.app.gain_value)
         self.i = self.i_dec = 0
+        self.sched = None
+        self.buf_clear()
         self.sld.config(to=self.reader.n - 1)
         fps = self.reader.fps
         # 소수 자릿수: 1프레임 차이가 보이도록 (2000fps → 0.0005s → 4자리)
@@ -774,6 +788,27 @@ class Panel:
         self.app.update_buttons()
         self.want_seek = int(float(v))
 
+    # ---- 프리페치 버퍼 ----
+    def buf_clear(self):
+        with self.buf_lock:
+            self.buf.clear()
+
+    def buf_len(self):
+        with self.buf_lock:
+            return len(self.buf)
+
+    def buf_put(self, at, idx, pil):
+        with self.buf_lock:
+            self.buf.append((at, idx, pil))
+
+    def buf_due(self, now):
+        """표시 시각이 지난 것 중 '가장 최근' 1장. 밀린 프레임은 버린다."""
+        got = None
+        with self.buf_lock:
+            while self.buf and self.buf[0][0] <= now:
+                got = self.buf.popleft()
+        return got
+
     def show(self, idx, photo):
         self.i = idx
         self._photo = photo
@@ -815,11 +850,7 @@ class App:
                             background=acc)
 
         self.cond, self.extras = {}, {}
-        # 표시 대기열: 패널당 '가장 최근 프레임 1장' 만 들고 있는다.
-        #   큐에 쌓아두면 메인 스레드가 보이지도 않을 프레임까지 전부
-        #   PhotoImage 로 변환하느라(장당 1~3 ms) UI 가 밀린다.
-        self._latest = {}
-        self._latest_lock = threading.Lock()
+
         self.stop_flag = False
         self.panel_size = PANEL_SIZE
         self._resize_job = None
@@ -994,7 +1025,7 @@ class App:
         for _p in (self.L, self.R):                 # 패널마다 워커 1개
             threading.Thread(target=self.decode_loop, args=(_p,),
                              daemon=True).start()
-        self.tk.after(15, self.poll_queue)
+        self.tk.after(4, self.poll_queue)
 
     # ---- 데이터 ----
     def set_root(self, root_dir):
@@ -1204,57 +1235,69 @@ class App:
 
     # ---- 디코드 워커 ----
     def decode_loop(self, p):
-        """패널 하나만 담당하는 디코드 워커 (좌·우가 각자 돈다).
+        """패널 하나를 담당하는 디코드 워커 (좌·우가 각자 돈다).
 
-        한 스레드가 두 패널을 번갈아 처리하면 디스크 대기(프레임 점프 시
-        약 13 ms)가 순서대로 쌓인다. 패널마다 스레드를 두면 두 파일의 대기가
-        서로 겹쳐 루프가 49 ms -> 12 ms 로 줄었다 (실측, 30프레임 점프 기준).
-        읽기/디코딩은 GIL 을 놓는 구간이라 실제로 병렬로 돈다.
+        패널마다 스레드를 두면 두 파일의 디스크 대기가 서로 겹친다.
+        각 프레임에는 '표시 예정 시각' 을 붙여 버퍼에 넣어두고, 실제로 화면에
+        올리는 일은 메인 스레드가 그 시각에 맞춰 한다. 워커가 몇 프레임
+        앞서 달릴 수 있으므로 디코드 시간이 들쭉날쭉해도 표시 간격은 고르다.
         """
-        next_t = time.time()
         while not self.stop_flag:
-            # 슬라이더/버튼 요청은 재생보다 먼저 (반응 지연 방지)
+            # 슬라이더/버튼 요청이 최우선 (반응 지연 방지)
             if p.want_seek is not None:
                 idx = p.want_seek
                 p.want_seek = None
-                p.t_last = None
-                self._decode_show(p, idx)
+                p.buf_clear()
+                self._decode_show(p, idx, 0.0)      # 0.0 = 즉시 표시
+                p.sched = None                      # 다음 재생 때 앵커 다시 잡기
                 continue
 
             if not (p.playing and p.reader):
-                p.t_last = None
-                time.sleep(0.004)          # 멈춰 있을 땐 CPU 를 놓아준다
+                p.sched = None
+                time.sleep(0.012)                   # 멈춰 있을 땐 CPU 를 놓아준다
+                continue
+
+            if p.buf_len() >= PREFETCH:             # 충분히 앞서 있음
+                time.sleep(0.002)
                 continue
 
             fps = self.fps_value
-            period = 1.0 / fps
+            disp = min(fps, DISPLAY_CAP)            # 실제 화면 갱신률
+            period = 1.0 / disp                     # 표시 간격
+            stride = fps / disp                     # 한 장당 건너뛸 원본 프레임 수
+
             now = time.time()
-            if now < next_t:
-                time.sleep(min(0.003, next_t - now))
-                continue
-            next_t = max(next_t + period, now - period)
-
-            # 실시간 재생: 경과 시간 x fps 만큼 전진. 설정 fps 가 디코딩
-            # 한계보다 높으면 중간 프레임을 건너뛰어 시간 비율을 지킨다.
-            now2 = time.time()
-            if p.t_last is None:
-                adv = 1
+            if p.sched is None or p.fps_ref != fps:  # 재생 시작 / 속도 변경
+                p.t_start = now
+                p.i_start = float(p.i_dec)
+                p.k = 0
+                p.fps_ref = fps
             else:
-                adv = int((now2 - p.t_last) * fps)
-                adv = max(1, min(adv, int(fps)))       # 폭주 방지 (최대 1초분)
-            p.t_last = now2
-            nxt = p.i_dec + adv          # ★ 표시 번호가 아니라 디코드 위치 기준
-            if nxt >= p.reader.n:
-                if self.opt_loop:
-                    nxt %= p.reader.n
-                else:
-                    nxt = p.reader.n - 1
-                    p.playing = False
-                    if nxt == p.i_dec:
-                        continue
-            self._decode_show(p, nxt)
+                p.k += 1
+                # 이미 지나간 슬롯은 건너뛴다 — 뒤처져도 시간축은 유지되므로
+                # 좌·우가 서로 벌어지지 않는다.
+                k_now = int((now - p.t_start) / period)
+                if p.k < k_now - 1:        # 한 슬롯 늦는 정도는 그냥 따라간다
+                    p.k = k_now            #   (매번 건너뛰면 간격이 더 튄다)
+            p.sched = p.t_start + p.k * period
 
-    def _decode_show(self, panel, idx):
+            idx = int(p.i_start + p.k * stride)
+            if idx >= p.reader.n:
+                if self.opt_loop:
+                    p.i_start -= p.reader.n         # 앵커만 되감아 시간축 유지
+                    idx = int(p.i_start + p.k * stride)
+                    if idx < 0 or idx >= p.reader.n:
+                        idx %= p.reader.n
+                else:
+                    idx = p.reader.n - 1
+                    p.playing = False
+                    p.sched = None
+                    self._decode_show(p, idx, 0.0)
+                    continue
+
+            self._decode_show(p, idx, p.sched)
+
+    def _decode_show(self, panel, idx, present_at=0.0):
         r = panel.reader
         if not r:
             return
@@ -1278,28 +1321,54 @@ class App:
             pil = Image.fromarray(rgb)
         except Exception:
             return
-        with self._latest_lock:
-            self._latest[panel] = (idx, pil)      # 이전 프레임은 버린다
+        panel.buf_put(present_at, idx, pil)
 
     def poll_queue(self):
-        """패널마다 최신 1장만 화면에 올린다 (한 틱당 최대 2장)."""
-        with self._latest_lock:
-            items = list(self._latest.items())
-            self._latest.clear()
-        for panel, (idx, pil) in items:
+        """표시 예정 시각이 된 프레임만 화면에 올린다 (패널당 최대 1장)."""
+        now = time.time()
+        for panel in (self.L, self.R):
+            item = panel.buf_due(now)
+            if item is None:
+                continue
+            _at, idx, pil = item
             try:
                 panel.show(idx, ImageTk.PhotoImage(pil))
             except Exception:
                 pass
         if not self.stop_flag:
-            self.tk.after(10, self.poll_queue)
+            # 재생 중에만 촘촘히 본다. 멈춰 있을 땐 느리게 — 슬라이더 조작은
+            # 20 ms 안에 반영되므로 체감 차이가 없고 유휴 CPU 를 아낀다.
+            busy = self.L.playing or self.R.playing
+            self.tk.after(4 if busy else 20, self.poll_queue)
 
     def on_close(self):
         self.stop_flag = True
         self.tk.after(60, self.tk.destroy)
 
+    @staticmethod
+    def _timer_begin():
+        """Windows 기본 타이머 해상도(15.6ms)에서는 time.sleep(3ms) 이
+        실제로 10ms 넘게 잠긴다. 재생 간격이 그 격자에 묶여 끊겨 보이므로
+        1ms 로 올린다 (미디어 앱의 표준 처리)."""
+        try:
+            ctypes.windll.winmm.timeBeginPeriod(1)
+            return True
+        except Exception:
+            return False
+
+    @staticmethod
+    def _timer_end():
+        try:
+            ctypes.windll.winmm.timeEndPeriod(1)
+        except Exception:
+            pass
+
     def run(self):
-        self.tk.mainloop()
+        self._timer_begin()          # 재생 간격이 10ms 격자에 묶이지 않도록
+        try:
+            self.tk.mainloop()
+        finally:
+            self._timer_end()
 
 
 def main():
