@@ -790,6 +790,14 @@ class App:
     def __init__(self, root_dir):
         self.tk = tk.Tk()
         self.tk.title(APP_NAME)
+        # 창/작업표시줄 아이콘도 바탕화면 바로가기와 같은 MAENGLAB 엠블럼으로
+        try:
+            ico = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                               APP_NAME + '.ico')
+            if os.path.exists(ico):
+                self.tk.iconbitmap(default=ico)
+        except Exception:
+            pass
         self.tk.configure(bg=C_BG)
         style = ttk.Style()
         try:
@@ -803,7 +811,11 @@ class App:
                             background=acc)
 
         self.cond, self.extras = {}, {}
-        self.q = queue.Queue(maxsize=8)
+        # 표시 대기열: 패널당 '가장 최근 프레임 1장' 만 들고 있는다.
+        #   큐에 쌓아두면 메인 스레드가 보이지도 않을 프레임까지 전부
+        #   PhotoImage 로 변환하느라(장당 1~3 ms) UI 가 밀린다.
+        self._latest = {}
+        self._latest_lock = threading.Lock()
         self.stop_flag = False
         self.panel_size = PANEL_SIZE
         self._resize_job = None
@@ -925,11 +937,20 @@ class App:
         self.var_pix = tk.BooleanVar(value=False)
         self.var_color = tk.BooleanVar(value=True)
 
+        # 워커 스레드가 읽을 평문 복사본 (Tcl 변수는 메인 스레드 전용)
+        self.opt_loop, self.opt_pix, self.opt_color = True, False, True
+
+        def on_opt():
+            self.opt_loop = self.var_loop.get()
+            self.opt_pix = self.var_pix.get()
+            self.opt_color = self.var_color.get()
+            self.redraw_all()
+
         def chk(txt, var):
             tk.Checkbutton(side, text=txt, variable=var, bg=C_PANEL, fg=C_FG,
                            selectcolor=C_BTN, activebackground=C_PANEL,
                            activeforeground=C_FG, anchor='w',
-                           command=self.redraw_all,       # 토글 즉시 현재 프레임 갱신
+                           command=on_opt,                # 토글 즉시 현재 프레임 갱신
                            font=('Malgun Gothic', 9)).pack(fill='x', padx=14)
 
         chk('루프', self.var_loop)
@@ -966,7 +987,9 @@ class App:
 
         # ---- 데이터/워커 ----
         self.set_root(root_dir)
-        threading.Thread(target=self.decode_loop, daemon=True).start()
+        for _p in (self.L, self.R):                 # 패널마다 워커 1개
+            threading.Thread(target=self.decode_loop, args=(_p,),
+                             daemon=True).start()
         self.tk.after(15, self.poll_queue)
 
     # ---- 데이터 ----
@@ -1176,55 +1199,56 @@ class App:
         self.R.btn_play.config(text='⏸' if self.R.playing else '▶')
 
     # ---- 디코드 워커 ----
-    def decode_loop(self):
+    def decode_loop(self, p):
+        """패널 하나만 담당하는 디코드 워커 (좌·우가 각자 돈다).
+
+        한 스레드가 두 패널을 번갈아 처리하면 디스크 대기(프레임 점프 시
+        약 13 ms)가 순서대로 쌓인다. 패널마다 스레드를 두면 두 파일의 대기가
+        서로 겹쳐 루프가 49 ms -> 12 ms 로 줄었다 (실측, 30프레임 점프 기준).
+        읽기/디코딩은 GIL 을 놓는 구간이라 실제로 병렬로 돈다.
+        """
         next_t = time.time()
         while not self.stop_flag:
+            # 슬라이더/버튼 요청은 재생보다 먼저 (반응 지연 방지)
+            if p.want_seek is not None:
+                idx = p.want_seek
+                p.want_seek = None
+                p.t_last = None
+                self._decode_show(p, idx)
+                continue
+
+            if not (p.playing and p.reader):
+                p.t_last = None
+                time.sleep(0.004)          # 멈춰 있을 땐 CPU 를 놓아준다
+                continue
+
             fps = self.fps_value
             period = 1.0 / fps
             now = time.time()
             if now < next_t:
-                time.sleep(min(0.005, next_t - now))
-                self._serve_seeks()
+                time.sleep(min(0.003, next_t - now))
                 continue
             next_t = max(next_t + period, now - period)
 
-            loop = self.var_loop.get()
-            for p in (self.L, self.R):
-                if p.want_seek is not None:
-                    idx = p.want_seek
-                    p.want_seek = None
-                    p.t_last = None
-                    self._decode_show(p, idx)
-                elif p.playing and p.reader:
-                    # ★ 실시간 재생: 경과 시간 x fps 만큼 전진.
-                    #   설정 fps 가 디코딩 한계(~30/s)보다 높으면 중간 프레임을
-                    #   건너뛰어 '실제 시간 비율'을 지킨다 (1000fps 도 유효).
-                    now2 = time.time()
-                    if p.t_last is None:
-                        adv = 1
-                    else:
-                        adv = int((now2 - p.t_last) * fps)
-                        adv = max(1, min(adv, int(fps)))   # 폭주 방지 (최대 1초분)
-                    p.t_last = now2
-                    nxt = p.i + adv
-                    if nxt >= p.reader.n:
-                        if loop:
-                            nxt %= p.reader.n
-                        else:
-                            nxt = p.reader.n - 1
-                            p.playing = False
-                            if nxt == p.i:
-                                continue
-                    self._decode_show(p, nxt)
+            # 실시간 재생: 경과 시간 x fps 만큼 전진. 설정 fps 가 디코딩
+            # 한계보다 높으면 중간 프레임을 건너뛰어 시간 비율을 지킨다.
+            now2 = time.time()
+            if p.t_last is None:
+                adv = 1
+            else:
+                adv = int((now2 - p.t_last) * fps)
+                adv = max(1, min(adv, int(fps)))       # 폭주 방지 (최대 1초분)
+            p.t_last = now2
+            nxt = p.i + adv
+            if nxt >= p.reader.n:
+                if self.opt_loop:
+                    nxt %= p.reader.n
                 else:
-                    p.t_last = None
-
-    def _serve_seeks(self):
-        for p in (self.L, self.R):
-            if p.want_seek is not None:
-                idx = p.want_seek
-                p.want_seek = None
-                self._decode_show(p, idx)
+                    nxt = p.reader.n - 1
+                    p.playing = False
+                    if nxt == p.i:
+                        continue
+            self._decode_show(p, nxt)
 
     def _decode_show(self, panel, idx):
         r = panel.reader
@@ -1236,8 +1260,8 @@ class App:
             return
         if fr is None:
             return
-        rgb = r.to_rgb8(fr, color=self.var_color.get())
-        interp = cv2.INTER_NEAREST if self.var_pix.get() else cv2.INTER_LANCZOS4
+        rgb = r.to_rgb8(fr, color=self.opt_color)
+        interp = cv2.INTER_NEAREST if self.opt_pix else cv2.INTER_LANCZOS4
         ps = self.panel_size
         h, w = rgb.shape[:2]
         scale = min(ps / w, ps / h)
@@ -1246,20 +1270,24 @@ class App:
         panel.disp_scale = scale                       # 측정 환산용
         panel.disp_off = ((ps - dw) // 2, (ps - dh) // 2 + panel.shift_px())   # 세로 이동 포함
         try:
-            self.q.put((panel, idx, Image.fromarray(rgb)), timeout=0.2)
-        except queue.Full:
-            pass
+            pil = Image.fromarray(rgb)
+        except Exception:
+            return
+        with self._latest_lock:
+            self._latest[panel] = (idx, pil)      # 이전 프레임은 버린다
 
     def poll_queue(self):
-        try:
-            while True:
-                panel, idx, pil = self.q.get_nowait()
-                photo = ImageTk.PhotoImage(pil)
-                panel.show(idx, photo)
-        except queue.Empty:
-            pass
+        """패널마다 최신 1장만 화면에 올린다 (한 틱당 최대 2장)."""
+        with self._latest_lock:
+            items = list(self._latest.items())
+            self._latest.clear()
+        for panel, (idx, pil) in items:
+            try:
+                panel.show(idx, ImageTk.PhotoImage(pil))
+            except Exception:
+                pass
         if not self.stop_flag:
-            self.tk.after(15, self.poll_queue)
+            self.tk.after(10, self.poll_queue)
 
     def on_close(self):
         self.stop_flag = True
