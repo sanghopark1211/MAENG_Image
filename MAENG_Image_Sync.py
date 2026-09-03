@@ -51,10 +51,9 @@ PANEL_SIZE   = 560        # 각 패널 '초기' 표시 크기 [px] — 창을 �
 PANEL_MIN    = 320        # 최소 패널 크기
 FPS_LIST     = [60, 30, 15, 5, 2, 1]
 DEFAULT_FPS  = 30
-DEFAULT_GAIN = 1.0        # 밝기 게인 초기값 = 무보정.
-                          #   파일마다 밝기가 크게 달라(1 m/min 은 x1.3, 30 m/min 은 x7 가
-                          #   적정) 고정값을 쓰면 한쪽이 하얗게 타버린다. 그래서 파일을
-                          #   열 때 첫 프레임 기준으로 자동 산출한다. [자동] 은 수동 재조정.
+DEFAULT_GAIN = 1.0        # 밝기 게인 = 1.0 (원본 그대로). 자동 보정은 하지 않는다 —
+                          #   눈으로 보며 우측 '밝기' 슬라이더로 직접 맞춘다.
+                          #   [자동] 버튼은 눌렀을 때만 현재 프레임에 맞춰준다.
 HOT_THR      = 250        # 핫픽셀 판정 문턱 [DN] — 같은 색 이웃 '최대값'보다 이만큼
                           #   밝은 고립 픽셀만 '반짝이'로 보고 치환한다.
                           #   중앙값 기준(과거)은 가공 중 밝은 구간에서 실제 스펙클
@@ -152,14 +151,13 @@ class CineReader:
         out[hot] = ref[hot].astype(raw.dtype)
         return out
 
-    def to_rgb8(self, fr, color=True, despeckle=True):
+    def to_rgb8(self, fr, color=True):
         if self.bpp is None:
             self.bpp = 12
         if self._lut is None:
             self._build_luts()
         maxv = (1 << self.bpp) - 1
-        if despeckle:
-            fr = self._despeckle(fr)                        # 핫픽셀(반짝이) 제거
+        fr = self._despeckle(fr)                            # 핫픽셀(반짝이)은 항상 제거
         raw16 = np.minimum(fr, maxv).astype(np.uint16, copy=False)
         if self.cfa == 0:                                   # 모노 센서
             return cv2.cvtColor(self._lut[raw16], cv2.COLOR_GRAY2RGB)
@@ -288,7 +286,6 @@ class Panel:
         self.t_last = None            # 실시간 재생 기준 시각 (프레임 스킵용)
         self._sld_guard = False
         self.t_dec = 0                # 시각 표시 소수 자릿수 (촬영 fps 로 결정)
-        self.auto_gain_pending = False # 파일을 연 직후 첫 프레임에서 게인 자동 산출
         self.free_y = None            # 자유면 위치 [원본 px, y] — '자유면 높이 맞추기'로 지정
         self.y_shift = 0.0            # 세로 이동량 [원본 px] — 배율은 그대로, 위치만
         self.free_items = []          # 자유면 점선/라벨 캔버스 아이템
@@ -730,7 +727,6 @@ class Panel:
             self.lbl_file.config(text=f'열기 실패: {e}')
             return
         self.reader.set_gain(self.app.gain_value)
-        self.auto_gain_pending = True        # 첫 프레임에서 밝기 자동 맞춤
         self.i = 0
         self.sld.config(to=self.reader.n - 1)
         fps = self.reader.fps
@@ -850,14 +846,14 @@ class App:
         def sec(title):
             tk.Label(side, text=title, bg=C_PANEL, fg=C_SUB, anchor='w',
                      font=('Malgun Gothic', 9, 'bold')
-                     ).pack(fill='x', padx=10, pady=(10, 2))
+                     ).pack(fill='x', padx=10, pady=(7, 1))
 
         def sbtn(t, c=None, big=False):
             b = tk.Button(side, text=t, command=c, bd=0, relief='flat',
                           cursor='hand2', bg=C_BTN, fg=C_FG, pady=6,
                           activebackground=C_BTN_HI, activeforeground=C_FG,
                           font=('Malgun Gothic', 10, 'bold' if big else 'normal'))
-            b.pack(fill='x', padx=10, pady=2)
+            b.pack(fill='x', padx=10, pady=1)
             return b
 
         # --- 그림판 (측정) ---
@@ -892,42 +888,42 @@ class App:
         bind_hold(b_an, lambda: self.step_all(+1))
         sbtn('⟲ 처음', self.home_all)
 
-        # --- 속도 ---
-        sec('속도')
+        # --- 속도 · 밝기 — 슬라이더와 값을 한 줄에 붙여 세로 공간을 아낀다.
+        #     여기서 아낀 만큼 아래 메모장이 커진다 (메모는 남는 공간 전부 사용) ---
+        sec('속도 · 밝기')
         self.fps_value = float(DEFAULT_FPS)
-        self.sld_fps = ttk.Scale(side, from_=1, to=1000, length=150,
+        frow = tk.Frame(side, bg=C_PANEL)
+        frow.pack(fill='x', padx=10)
+        self.sld_fps = ttk.Scale(frow, from_=1, to=1000,
                                  value=DEFAULT_FPS, command=self.on_fps)
-        self.sld_fps.pack(fill='x', padx=12)
-        self.lbl_fps = tk.Label(side, text=f'{DEFAULT_FPS:.0f} fps',
-                                bg=C_PANEL, fg=C_FG,
-                                font=('Consolas', 11, 'bold'))
-        self.lbl_fps.pack()
+        self.sld_fps.pack(side='left', fill='x', expand=True)
+        self.lbl_fps = tk.Label(frow, text=f'{DEFAULT_FPS:.0f} fps',
+                                width=8, anchor='e', bg=C_PANEL, fg=C_FG,
+                                font=('Consolas', 10, 'bold'))
+        self.lbl_fps.pack(side='right')
 
-        # --- 밝기 (게인) — 어두운 촬영본을 LUT 단계에서 증폭 (프레임당 비용 0) ---
-        sec('밝기')
         self.gain_value = float(DEFAULT_GAIN)
         self._gain_job = None
         self._gain_guard = False
-        self.sld_gain = ttk.Scale(side, from_=1, to=8, length=150,
-                                  value=DEFAULT_GAIN, command=self.on_gain)
-        self.sld_gain.pack(fill='x', padx=12)
         grow = tk.Frame(side, bg=C_PANEL)
-        grow.pack(fill='x', padx=10)
-        self.lbl_gain = tk.Label(grow, text=f'x{DEFAULT_GAIN:.1f}',
-                                 bg=C_PANEL, fg=C_FG,
-                                 font=('Consolas', 11, 'bold'))
-        self.lbl_gain.pack(side='left', expand=True)
+        grow.pack(fill='x', padx=10, pady=(3, 0))
+        self.sld_gain = ttk.Scale(grow, from_=1, to=8,
+                                  value=DEFAULT_GAIN, command=self.on_gain)
+        self.sld_gain.pack(side='left', fill='x', expand=True)
         tk.Button(grow, text='자동', command=self.auto_gain, bd=0, relief='flat',
-                  cursor='hand2', bg=C_BTN, fg=C_FG, padx=10, pady=2,
+                  cursor='hand2', bg=C_BTN, fg=C_FG, padx=6,
                   activebackground=C_BTN_HI, activeforeground=C_FG,
-                  font=('Malgun Gothic', 9)).pack(side='right')
+                  font=('Malgun Gothic', 8)).pack(side='right')
+        self.lbl_gain = tk.Label(grow, text=f'x{DEFAULT_GAIN:.1f}',
+                                 width=5, anchor='e', bg=C_PANEL, fg=C_FG,
+                                 font=('Consolas', 10, 'bold'))
+        self.lbl_gain.pack(side='right', padx=(0, 4))
 
         # --- 옵션 ---
         sec('옵션')
         self.var_loop = tk.BooleanVar(value=True)
         self.var_pix = tk.BooleanVar(value=False)
         self.var_color = tk.BooleanVar(value=True)
-        self.var_despk = tk.BooleanVar(value=True)   # 반짝이(핫픽셀) 제거
 
         def chk(txt, var):
             tk.Checkbutton(side, text=txt, variable=var, bg=C_PANEL, fg=C_FG,
@@ -948,25 +944,16 @@ class App:
                  font=('Malgun Gothic', 8)).pack(fill='x', padx=14)
         chk('픽셀 선명', self.var_pix)
         chk('컬러', self.var_color)
-        chk('반짝이 제거', self.var_despk)
 
         # ===== 메모장: 우측 컬럼 하단 (남는 공간 전부) =====
-        sec('📝 메모 (자동 저장)')
-        self.memo = tk.Text(side, width=26, bg='#12151a', fg=C_FG,
+        sec('📝 메모')
+        self.memo = tk.Text(side, width=26, height=12, bg='#12151a', fg=C_FG,
                             insertbackground=C_FG, relief='flat',
                             font=('Malgun Gothic', 9), wrap='word')
         self.memo.pack(fill='both', expand=True, padx=10, pady=(2, 8))
         tk.Label(side, text='Space 동시재생 · ←→ 1프레임 · Home 처음',
                  bg=C_PANEL, fg=C_SUB, font=('Malgun Gothic', 8)
                  ).pack(side='bottom', pady=(0, 6))
-        self.memo_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                      'memo.txt')
-        try:
-            if os.path.exists(self.memo_path):
-                with open(self.memo_path, encoding='utf-8') as fmemo:
-                    self.memo.insert('1.0', fmemo.read())
-        except Exception:
-            pass
 
         # ---- 단축키/종료 ----
         self.tk.bind('<space>', lambda e: self.toggle_all())
@@ -1081,13 +1068,6 @@ class App:
     def log_memo(self, line):
         self.memo.insert('end', line + '\n')
         self.memo.see('end')
-
-    def save_memo(self):
-        try:
-            with open(self.memo_path, 'w', encoding='utf-8') as fmemo:
-                fmemo.write(self.memo.get('1.0', 'end-1c'))
-        except Exception:
-            pass
 
     def on_fps(self, v):
         self.fps_value = max(1.0, float(v))
@@ -1256,11 +1236,7 @@ class App:
             return
         if fr is None:
             return
-        if panel.auto_gain_pending and r.bpp:
-            panel.auto_gain_pending = False
-            self._fit_gain(panel, fr)
-        rgb = r.to_rgb8(fr, color=self.var_color.get(),
-                        despeckle=self.var_despk.get())
+        rgb = r.to_rgb8(fr, color=self.var_color.get())
         interp = cv2.INTER_NEAREST if self.var_pix.get() else cv2.INTER_LANCZOS4
         ps = self.panel_size
         h, w = rgb.shape[:2]
@@ -1274,25 +1250,6 @@ class App:
         except queue.Full:
             pass
 
-    def _fit_gain(self, panel, raw):
-        """이 프레임의 상위 0.3% 가 흰색 직전에 오도록 게인 산출 (패널 독립).
-           촬영 조건마다 노출이 달라 — 1 m/min 은 x1.3, 30 m/min 은 x7 정도 —
-           공통 게인을 쓰면 한쪽이 포화된다."""
-        r = panel.reader
-        try:
-            base = r._despeckle(raw)          # 핫픽셀이 상위 백분위를 끌어올리므로 제외
-            p997 = float(np.percentile(base, 99.7))
-            g = min(8.0, max(1.0, ((1 << r.bpp) - 1) / max(p997, 1.0)))
-        except Exception:
-            return
-        r.set_gain(g)
-        self.tk.after(0, self._show_gain)
-
-    def _show_gain(self):
-        gs = [p.reader.gain for p in (self.L, self.R) if p.reader]
-        if gs:
-            self.lbl_gain.config(text=' | '.join(f'x{g:.1f}' for g in gs))
-
     def poll_queue(self):
         try:
             while True:
@@ -1305,7 +1262,6 @@ class App:
             self.tk.after(15, self.poll_queue)
 
     def on_close(self):
-        self.save_memo()
         self.stop_flag = True
         self.tk.after(60, self.tk.destroy)
 
